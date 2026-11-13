@@ -47,13 +47,19 @@
     <label class="auto" title="CONSEJO: varias IAs responden a la vez y una de ellas combina la mejor respuesta">
       <input type="checkbox" id="council"> ⚖ CONSEJO
     </label>
+    <label class="auto" title="Hilo privado: solo responden tus equipos (el puente de tu PC o los que marques en ⬡). Ningún dato sale a IAs externas.">
+      <input type="checkbox" id="private"> 🔒 PRIVADO
+    </label>
+    <button type="button" class="auto skillbtn" id="btnSkills" title="Habilidades: procedimientos reutilizables que se aplican a este hilo con cualquier IA">✦ HABILIDADES</button>
     <label class="auto" id="toolsLbl" hidden title="Deja que la IA use las herramientas de tus servidores MCP (buscar y leer tus documentos, estado del PC…)">
       <input type="checkbox" id="useTools"> ƒ HERRAMIENTAS
     </label>
   </nav>
 
+  <div id="saveWarn" class="hintbar warn" role="alert" hidden></div>
   <main id="log" aria-live="polite"></main>
 
+  <div id="skillHint" class="hintbar" hidden></div>
   <div id="attachBar" class="chips" hidden></div>
   <form id="composer">
     <button type="button" class="ico tool" id="attachBtn" aria-label="Adjuntar imagen, PDF o texto" title="Adjuntar imagen, PDF o texto">📎</button>
@@ -67,6 +73,8 @@
 <section class="sheet" id="sheetThreads" aria-hidden="true">
   <div class="sheet-in">
     <header><h2>HILOS <em>// GUARDADOS</em></h2><button class="ico close">✕</button></header>
+    <select id="projectSel" class="search" aria-label="Proyecto"></select>
+    <div id="projectCard"></div>
     <button class="btn wide" id="newThread">+ NUEVO HILO</button>
     <input type="search" id="threadSearch" class="search" placeholder="BUSCAR EN LOS HILOS…" aria-label="Buscar en los hilos">
     <div id="threadList"></div>
@@ -77,6 +85,21 @@
       <button class="btn sm ghost" id="importBtn">IMPORTAR (.json)</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
+  </div>
+</section>
+
+<section class="sheet" id="sheetSkills" aria-hidden="true">
+  <div class="sheet-in">
+    <header><h2>HABILIDADES <em>// SKILLS</em></h2><button class="ico close">✕</button></header>
+    <p class="hint">Una habilidad es un procedimiento que repites a menudo (resumir apuntes, redactar con tu estilo…). Actívala en un hilo y se aplicará con cualquier IA, también si AUTO-SALTO cambia de modelo. Es solo texto: no da permisos ni ejecuta nada.</p>
+    <div id="skillList"></div>
+    <div class="row wrap">
+      <button class="btn sm" id="skNew">+ CREAR CON IA</button>
+      <button class="btn sm ghost" id="skBlank">+ EN BLANCO</button>
+      <button class="btn sm ghost" id="skImport">IMPORTAR SKILL.md</button>
+      <input type="file" id="skFile" accept=".md,text/markdown,text/plain" hidden>
+    </div>
+    <div id="skEditor"></div>
   </div>
 </section>
 

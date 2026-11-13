@@ -61,13 +61,20 @@ const DEFAULT_INSTRUCTIONS = 'Responde siempre en español y solo en español: n
 // ---------- estado ----------
 const S = Object.assign({
   providers: [], mcp: [], threads: [], active: null, target: null, autoSkip: true,
-  health: {}, ctxTokens: 6000, instructions: DEFAULT_INSTRUCTIONS, council: false, councilKeys: [], useTools: false, vault: null,
+  health: {}, ctxTokens: 6000, instructions: DEFAULT_INSTRUCTIONS, council: false, councilKeys: [], useTools: false, vault: null, skills: [], projects: [], project: null,
 }, load());
 // Migración: el chat único de versiones anteriores pasa a ser el primer hilo.
 if (S.messages) { if (S.messages.length) S.threads.unshift({ id: S.active = uid(), title: S.messages.find((m) => m.role === 'user')?.content.slice(0, 48) || 'HILO', messages: S.messages, ts: Date.now() }); delete S.messages; }
 // Gemini retiró los 2.5: se pasa a los alias que siempre apuntan al modelo vigente.
 const GEMINI_OLD = { 'gemini-2.5-flash': 'gemini-flash-latest', 'gemini-2.5-flash-lite': 'gemini-flash-lite-latest' };
 S.providers.filter((p) => p.preset === 'gemini').forEach((p) => { p.models = [...new Set(p.models.map((m) => GEMINI_OLD[m] || m))]; });
+if (!S.v111) {
+  for (const p of S.providers.filter((x) => x.preset === 'gemini')) p.models.sort((a, b) => modelRank(a) - modelRank(b));
+  const [pid, model] = String(S.target || '').split('::');
+  const gp = S.providers.find((x) => x.id === pid && x.preset === 'gemini');
+  if (gp && modelRank(model) >= 4) S.target = `${gp.id}::${gp.models[0]}`;
+  S.v111 = true;
+}
 // Los mensajes necesitan id para fusionar hilos entre dispositivos sin duplicarlos.
 S.threads.forEach((t) => t.messages.forEach((m) => { m.id ||= uid() + uid(); }));
 function thread() {
@@ -84,10 +91,78 @@ function save() {
     st.mcp = st.mcp.map((m) => (m.local ? m : (({ token, ...x }) => x)(m)));
     if (vault.key) sealSoon();
   }
-  const data = JSON.stringify(st);
-  try { if (DESK) DESK.save(data); else localStorage.setItem(LS, data); }
-  catch (e) { toast('No se pudo guardar: ' + e.message, true); }
+  // Los adjuntos ya guardados en IndexedDB se quedan fuera: el hilo solo conserva su referencia.
+  const data = JSON.stringify(st, (k, v) => (v && v.ref && (v.kind === 'image' || v.kind === 'text') ? { ...v, data: undefined, text: undefined } : v));
+  try { if (DESK) DESK.save(data); else localStorage.setItem(LS, data); storageWarn(null); }
+  catch (e) { storageWarn(e); }
 }
+// Aviso fijo (no un mensaje que desaparece) mientras lo último no esté guardado.
+function storageWarn(e) {
+  const el = document.getElementById('saveWarn');
+  if (!el) return;
+  el.hidden = !e;
+  if (e) el.innerHTML = `⚠️ No se ha podido guardar (${esc(/quota/i.test(e.name + e.message) ? 'almacenamiento lleno' : e.message)}). Lo último sigue en pantalla: <button type="button" class="btn sm" id="saveWarnExport">EXPORTAR COPIA</button>`;
+}
+
+// ---------- adjuntos en IndexedDB ----------
+// Imágenes (binario) y textos de PDF fuera del estado: el almacenamiento del navegador (~5 MB) no da para ellos.
+// Orden seguro: primero se guarda el archivo y después la referencia; si algo se corta, el hilo conserva el contenido.
+const blobs = (() => {
+  let dbp;
+  const open = () => (dbp ||= new Promise((res, rej) => {
+    const r = indexedDB.open('neura-adjuntos', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('files');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  }));
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction('files', mode), q = fn(t.objectStore('files'));
+      t.oncomplete = () => res(q.result); t.onerror = t.onabort = () => rej(t.error || new Error('IndexedDB'));
+    });
+  };
+  return { put: (id, v) => run('readwrite', (st) => st.put(v, id)), get: (id) => run('readonly', (st) => st.get(id)),
+    del: (id) => run('readwrite', (st) => st.delete(id)), keys: () => run('readonly', (st) => st.getAllKeys()) };
+})();
+const field = (f) => (f.kind === 'image' ? 'data' : 'text');
+const allFiles = () => S.threads.flatMap((t) => t.messages.flatMap((m) => m.files || []));
+function toBlob(dataUrl) {
+  const [, type, b64] = dataUrl.match(/^data:([^;]+);base64,(.*)$/) || [];
+  if (!b64) return dataUrl;
+  return new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type });
+}
+const toDataUrl = (b) => (typeof b === 'string' ? Promise.resolve(b) : new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(b); }));
+async function storeFile(f) {
+  const id = uid() + uid();
+  await blobs.put(id, f.kind === 'image' ? toBlob(f.data) : f.text);
+  f.ref = id; // la referencia solo existe cuando el archivo ya está guardado
+}
+// Guarda en IndexedDB los adjuntos que aún van dentro del estado (versiones antiguas, sincronizados o importados).
+let persisting = null;
+function persistFiles() {
+  return (persisting ||= (async () => {
+    let n = 0;
+    for (const f of allFiles()) {
+      if (f.ref || f[field(f)] == null) continue;
+      try { await storeFile(f); n++; } catch (e) { storageWarn(e); break; }
+    }
+    if (n) save();
+  })().finally(() => { persisting = null; }));
+}
+// Al abrir: recupera el contenido de cada referencia y borra los archivos que ya no usa ningún hilo.
+async function hydrateFiles() {
+  const used = new Set();
+  for (const f of allFiles()) {
+    if (!f.ref) continue;
+    used.add(f.ref);
+    if (f[field(f)] != null) continue;
+    try { const v = await blobs.get(f.ref); if (v == null) f.missing = true; else f[field(f)] = f.kind === 'image' ? await toDataUrl(v) : v; }
+    catch { f.missing = true; }
+  }
+  try { for (const k of await blobs.keys()) if (!used.has(k)) await blobs.del(k); } catch {}
+}
+// Las referencias son de este dispositivo: al exportar o sincronizar viaja el contenido original.
+const portable = (list) => JSON.parse(JSON.stringify(list, (k, v) => (k === 'ref' || k === 'missing' ? undefined : v)));
 // Fusión de un hilo de dos dispositivos: mensajes unidos por id, el resto lo gana el ts más reciente.
 // Mantener igual que mergeThread() en bridge/server.mjs.
 function mergeThread(a, b) {
@@ -123,14 +198,18 @@ function parseWait(text) {
 }
 const untilMidnightUTC = () => { const d = new Date(); d.setUTCHours(24, 0, 30, 0); return Math.ceil((d - Date.now()) / 1000); };
 // Modelo retirado o inexistente: no volverá, hay que pedir la lista actual al proveedor.
-const isGone = (e) => e.status === 404 || /not found|no longer available|not supported for|does not exist|decommissioned|has been deprecated|model_not_found/i.test(e.message || '');
+const isGone = (e) => !isNoVision(e) && (e.status === 404 || /not found|no longer available|not supported for|does not exist|decommissioned|has been deprecated|model_not_found/i.test(e.message || ''));
 // Gemini y otras devuelven 400 (no 401) con una clave inválida.
 const isKeyErr = (e) => e.status === 401 || e.status === 403 || (e.status === 400 && /api.?key|unauthori[sz]ed|invalid.{0,12}(key|token|credential)/i.test(e.message || ''));
 function noteOk(t, ms) { Object.assign(H(t.key), { coolUntil: 0, reason: null, streak: 0 }); const h = H(t.key); h.ok++; h.ms = h.ms ? Math.round(h.ms * 0.7 + ms * 0.3) : ms; }
+// El modelo rechazó la imagen: sirve para texto, pero no hay que mandarle fotos.
+const isNoVision = (e) => e.status === 400 && /image|vision|multimodal|modalit/i.test(e.message || '');
+const capable = (t, needs = {}) => !(needs.vision && S.health[t.key]?.noVision);
 function noteFail(t, e) {
   if (e.name === 'AbortError') return;
   const h = H(t.key), msg = e.message || '';
   h.fail++; h.streak = (h.streak || 0) + 1;
+  if (isNoVision(e)) { Object.assign(h, { noVision: true, streak: 0 }); return; }
   if (e.status === 429 || /quota|rate.?limit|resource.?exhausted|too many requests/i.test(msg)) {
     let wait = e.retryAfter || parseWait(msg) || 60;
     if (!e.retryAfter && /per.?day|daily|\bRPD\b|\bTPD\b|por día|diari/i.test(msg)) wait = untilMidnightUTC();
@@ -142,22 +221,41 @@ function noteFail(t, e) {
     // Una clave rechazada afecta a todos los modelos del proveedor hasta que la cambies.
     for (const x of targets()) if (x.pid === t.pid) Object.assign(H(x.key), { coolUntil: Date.now() + 365 * 864e5, reason: 'CLAVE' });
   } else if (e.status === 402) Object.assign(h, { coolUntil: Date.now() + 3600e3, reason: 'SALDO' });
-  else if (h.streak >= 2) Object.assign(h, { coolUntil: Date.now() + 30e3 * Math.min(h.streak, 10), reason: 'FALLA' });
+  // Un modelo caído o saturado se pausa desde el primer fallo, para no hacer esperar en cada mensaje.
+  else Object.assign(h, { coolUntil: Date.now() + 60e3 * Math.min(h.streak, 10), reason: 'FALLA' });
 }
 function score(t) {
   const h = S.health[t.key] || {};
   const rate = ((h.ok || 0) + 1) / ((h.ok || 0) + (h.fail || 0) + 2);
   return rate - 0.3 * (h.ms ? Math.min(h.ms, 60000) / 60000 : 0.3);
 }
+// ---------- política de destinos: gasto y privacidad ----------
+// "Gratis" solo si es comprobable: proveedor del nivel gratuito (en OpenRouter, variantes :free) o un equipo tuyo.
+// Backend del puente que atiende un modelo MCP; el puente indica si es local (tu equipo o tu red privada).
+const mcpBackend = (t) => S.mcp.find((s) => s.id === t.sid)?.backends?.find((b) => t.model.startsWith(b.id + '/'));
+const localBackend = (t) => mcpBackend(t)?.local === true;
+// Un puente puede reenviar a una API externa de pago: solo cuenta como gratis si su backend es local.
+function isFree(t) {
+  if (t.kind === 'mcp') return localBackend(t);
+  const p = S.providers.find((x) => x.id === t.pid);
+  return p?.tier === 'free' && (!p.freeOnly || /:free$/.test(t.model));
+}
+// "Privado": un equipo tuyo (puente de este PC o marcado como tuyo) y además con backend local.
+const isMine = (t) => t.kind === 'mcp' && localBackend(t) && S.mcp.some((s) => s.id === t.sid && (s.local || s.mine));
+const allowed = (t) => (!S.freeOnly || isFree(t)) && (!thread().private || isMine(t));
+const notAllowedWhy = (t) => (thread().private && !isMine(t) ? 'no es un equipo tuyo y este hilo es 🔒 PRIVADO' : 'es de pago o de coste desconocido y tienes SOLO GRATIS activado');
 // Orden de intento: la elegida, luego las disponibles por calidad (otros proveedores primero) y al final las agotadas.
-function plan(first) {
+// Nunca incluye destinos que la política de gasto o privacidad no permite.
+// needs.vision: el mensaje lleva imágenes; se evitan los modelos que ya las rechazaron.
+function plan(first, needs = {}) {
   if (!first) return [];
-  if (!S.autoSkip) return [first];
-  const rest = targets().filter((t) => t.key !== first.key);
-  const adj = (t) => score(t) - (t.pid && t.pid === first.pid ? 0.5 : 0);
+  const own = allowed(first) && capable(first, needs) ? [first] : [];
+  if (!S.autoSkip) return own;
+  const rest = targets().filter((t) => t.key !== first.key && allowed(t) && capable(t, needs));
+  const adj = (t) => score(t) - (t.pid && t.pid === first.pid ? 0.5 : 0) - (S.useTools && S.health[t.key]?.noTools ? 0.4 : 0);
   const ready = rest.filter((t) => !cooling(t.key)).sort((a, b) => adj(b) - adj(a));
   const cold = rest.filter((t) => cooling(t.key)).sort((a, b) => S.health[a.key].coolUntil - S.health[b.key].coolUntil);
-  return [first, ...ready, ...cold];
+  return [...own, ...ready, ...cold];
 }
 function coolText(k) {
   const h = S.health[k];
@@ -201,7 +299,8 @@ function toolbox() {
   }
   return list;
 }
-const trusted = (s) => s.local || s.serverInfo?.name === 'neura-bridge' || s.trustTools;
+// Solo se confía en el puente de este PC o en servidores que autorizaste tú (el nombre que declara un servidor no cuenta).
+const trusted = (s) => s.local || s.trustTools;
 async function runTool(tb, name, rawArgs, signal, onTool) {
   const x = tb.find((y) => y.name === name);
   let args = rawArgs;
@@ -276,7 +375,8 @@ async function callOpenAI(p, model, messages, onDelta, signal, opt = {}) {
     if (!r.ok && body.tools && r.status === 400) {
       const t = await r.text();
       if (!/tool|function/i.test(t)) throw httpErr(400, t, r.headers);
-      tools = []; delete body.tools; // el modelo no admite herramientas: se responde sin ellas
+      tools = []; delete body.tools; // el modelo no admite herramientas: se responde sin ellas y se recuerda
+      H(`${p.id}::${model}`).noTools = true;
       r = await post(body);
     }
     if (!r.ok) throw httpErr(r.status, await r.text(), r.headers);
@@ -336,6 +436,7 @@ async function callTarget(t, messages, onDelta, signal, opt = {}) {
     const args = { model: t.model, messages };
     // Con herramientas, el puente deja que el modelo local use los archivos compartidos del PC.
     if (opt.tools && (s.tools || []).some((x) => x.name === 'read_file')) args.tools = true;
+    if (thread().private) args.local_only = true; // el puente también lo comprueba
     let acc = '';
     const r = await mcpRpc(s, 'tools/call', { name: 'chat', arguments: args }, { signal, onProgress: (d) => { acc += d; onDelta(acc); } });
     const txt = (r.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
@@ -361,6 +462,12 @@ async function fetchModels(p) {
   return list.map((m) => (typeof m === 'string' ? m : m.id || m.name).replace(/^models\//, ''))
     .filter((id) => id && !/embed|imagen|veo|tts|whisper|transcri|dall-e|moderation|rerank|guard|audio|live|image-generation|robotics|computer-use|aqa/i.test(id));
 }
+// Orden recomendado: Flash vigente primero (cuota gratuita amplia), Pro después (poca cuota gratis)
+// y al final los experimentales o de vista previa, que fallan a menudo.
+function modelRank(m) {
+  return /preview|-exp(-|$)|experimental|alpha|beta|hydrogen/i.test(m) ? 5 : /\bpro\b/i.test(m) ? 4
+    : /flash(-lite)?-latest$/.test(m) ? (/lite/.test(m) ? 1 : 0) : /-latest$/.test(m) ? 2 : 3;
+}
 // Una vez por sesión y proveedor: si un modelo ya no existe, se trae la lista vigente.
 const refreshed = new Set();
 async function refreshModels(p, quiet = false) {
@@ -369,8 +476,7 @@ async function refreshModels(p, quiet = false) {
   try {
     const list = await fetchModels(p);
     if (!list.length) return;
-    // Los alias "-latest" de Gemini primero: siempre apuntan al modelo vigente.
-    p.models = [...list.filter((m) => /-latest$/.test(m)), ...list.filter((m) => !/-latest$/.test(m))];
+    p.models = list.sort((a, b) => modelRank(a) - modelRank(b));
     save(); renderTargets();
     if ($('#sheetAis').classList.contains('open')) renderProviders();
     if (!quiet) toast(`${p.name}: lista de modelos actualizada (${list.length})`);
@@ -455,9 +561,12 @@ async function syncWith(s) {
   const startedAt = Date.now();
   try {
     // Solo se envía lo cambiado desde la última vez; los mensajes a medias no salen del dispositivo.
-    const out = S.threads.filter((t) => t.ts > (s.pushedAt || 0) && (t.deleted || t.messages.length))
-      .map((t) => ({ ...t, messages: t.messages.filter((m) => !m.pending) }));
-    const r = await mcpRpc(s, 'tools/call', { name: 'threads_sync', arguments: { since: s.syncRev || 0, threads: out } });
+    // Los hilos privados solo se copian a tus equipos.
+    const out = S.threads.filter((t) => t.ts > (s.pushedAt || 0) && (t.deleted || t.messages.length) && (!t.private || s.local || s.mine))
+      .map((t) => portable({ ...t, messages: t.messages.filter((m) => !m.pending) }));
+    const newer = (list) => list.filter((x) => (x.updatedAt || 0) > (s.pushedAt || 0));
+    const collections = { skills: newer(S.skills), projects: newer(S.projects) };
+    const r = await mcpRpc(s, 'tools/call', { name: 'threads_sync', arguments: { since: s.syncRev || 0, threads: out, collections } });
     if (r.isError) throw new Error(r.content?.[0]?.text || 'Error al sincronizar');
     const data = r.structuredContent || JSON.parse(r.content?.[0]?.text || '{}');
     let changed = false;
@@ -470,9 +579,24 @@ async function syncWith(s) {
       if (i >= 0) S.threads[i] = merged; else S.threads.push(merged);
       changed = true;
     }
+    // Habilidades y proyectos: gana la versión más reciente (también los borrados).
+    for (const [name, items] of Object.entries(data.collections || {})) {
+      const list = S[name];
+      if (!['skills', 'projects'].includes(name) || !Array.isArray(items)) continue;
+      for (const it of items) {
+        const i = list.findIndex((x) => x.id === it.id);
+        if (i < 0) list.push(it); else if ((it.updatedAt || 0) > (list[i].updatedAt || 0)) list[i] = it; else continue;
+        changed = true;
+      }
+    }
+    if (changed) persistFiles();
     s.syncRev = data.rev; s.pushedAt = startedAt; s.syncedAt = Date.now(); s.syncError = null;
     save();
-    if (changed && !busy) { renderLog(); if ($('#sheetThreads').classList.contains('open')) renderThreads(); }
+    if (changed && !busy) {
+      renderLog();
+      if ($('#sheetThreads').classList.contains('open')) renderThreads();
+      if ($('#sheetSkills').classList.contains('open') && !skDraft) renderSkills();
+    }
   } catch (e) { s.syncError = netHint(e); }
   finally { s.syncing = false; if ($('#sheetMcp').classList.contains('open')) renderMcp(); }
 }
@@ -482,8 +606,8 @@ const syncAll = () => S.mcp.forEach((s) => syncWith(s));
 // Las imágenes solo se reenvían en los últimos mensajes; antes quedan como una nota de texto.
 function userContent(m, withImg) {
   let text = m.content || '';
-  for (const f of m.files || []) if (f.kind === 'text') text += `\n\n[Archivo adjunto: ${f.name}]\n\`\`\`\n${f.text}\n\`\`\``;
-  const imgs = (m.files || []).filter((f) => f.kind === 'image');
+  for (const f of m.files || []) if (f.kind === 'text') text += `\n\n[Archivo adjunto: ${f.name}${f.pdf ? ' — al usar su contenido, cita la página así: (pág. N)' : ''}]\n\`\`\`\n${f.text}\n\`\`\``;
+  const imgs = (m.files || []).filter((f) => f.kind === 'image' && f.data);
   if (!imgs.length) return text;
   if (!withImg) return text + imgs.map((f) => `\n[Imagen adjunta: ${f.name}]`).join('');
   return [{ type: 'text', text: text || 'Describe la imagen.' }, ...imgs.map((f) => ({ type: 'image_url', image_url: { url: f.data } }))];
@@ -515,17 +639,21 @@ function trimTo(h, budget) {
   while (out.length > 2 && tokens(out) > budget) out.splice(out[0].role === 'system' ? 1 : 0, 1);
   return out;
 }
-// Para resumir se prefiere la IA local (gratis y sin límites), luego la elegida y luego las demás disponibles.
-async function summarize(messages, signal) {
+// Petición auxiliar (resúmenes, crear habilidades…) a la primera IA disponible y permitida; con preferMine, antes tus equipos.
+async function ask(messages, signal, preferMine = false) {
   const all = targets().filter((t) => !cooling(t.key));
-  const order = [...all.filter((t) => t.kind === 'mcp'), findT(S.target), ...plan(findT(S.target)).slice(1)].filter((t, i, a) => t && !cooling(t.key) && a.findIndex((x) => x?.key === t.key) === i);
+  const mine = preferMine ? [...all.filter(isMine), ...all.filter((t) => t.kind === 'mcp')] : [];
+  const order = [...mine, ...plan(findT(S.target))]
+    .filter((t, i, a) => t && !cooling(t.key) && allowed(t) && a.findIndex((x) => x?.key === t.key) === i);
   let last;
   for (const t of order.slice(0, 3)) {
-    try { const r = await callTarget(t, messages, () => {}, signal); if (r?.trim()) return r.trim(); }
+    try { const r = noThink(await callTarget(t, messages, () => {}, signal)); if (r.trim()) return { text: r.trim(), t }; }
     catch (e) { if (e.name === 'AbortError') throw e; noteFail(t, e); last = e; }
   }
-  throw last || new Error('Sin IA para resumir');
+  throw last || new Error('No hay ninguna IA disponible');
 }
+// Para resumir se prefiere la IA local (gratis y sin límites), luego la elegida y luego las demás disponibles.
+const summarize = async (messages, signal) => (await ask(messages, signal, true)).text;
 // Si el historial no cabe, lo antiguo se resume (y se guarda en el hilo) y se envía resumen + lo reciente.
 async function fitContext(th, hist, budget, signal) {
   if (tokens(hist) <= budget) return hist;
@@ -553,10 +681,11 @@ async function fitContext(th, hist, budget, signal) {
 
 // ---------- envío ----------
 // Errores que merecen probar otra IA: cuota agotada, sobrecarga, sin conexión, clave inválida.
-const skippable = (e) => e.name !== 'AbortError' && (!e.status || e.status === 429 || e.status >= 500 || e.status === 402 || isKeyErr(e) || isGone(e));
+const skippable = (e) => e.name !== 'AbortError' && (!e.status || e.status === 429 || e.status >= 500 || e.status === 402 || isKeyErr(e) || isGone(e) || isNoVision(e));
 function friendly(e) {
   if (e.name === 'AbortError') return 'Cancelado';
   if (isGone(e)) return 'Este modelo ya no está disponible. Neura ha actualizado la lista de modelos.';
+  if (isNoVision(e)) return 'Este modelo no admite imágenes.';
   if (e.status === 429 || /quota|rate.?limit|exhausted/i.test(e.message || '')) return 'Cuota gratuita agotada por ahora.';
   if (isKeyErr(e)) return 'La clave API no es válida. Revísala en ⚙.';
   if (e.status === 402) return 'Sin saldo en esta cuenta.';
@@ -573,11 +702,26 @@ function failMsg(msg, e, t) {
 }
 // Algunos modelos escriben su razonamiento interno (a menudo en inglés) entre <think>…</think>.
 const noThink = (s) => String(s || '').replace(/<(think|thinking|thought)>[\s\S]*?(<\/\1>|$)/gi, '').trimStart();
-const withInstructions = (hist) => (S.instructions?.trim() ? [{ role: 'system', content: S.instructions.trim() }, ...hist] : hist);
-async function runTarget(t, hist, msg, signal, tools) {
+const liveSkills = () => S.skills.filter((k) => !k.deleted);
+const activeSkill = () => { const id = thread().skill; return id ? liveSkills().find((k) => k.id === id) : null; };
+const activeProject = () => { const id = thread().project; return id ? S.projects.find((p) => p.id === id && !p.deleted) : null; };
+// Se reconstruye en cada petición desde la versión guardada: no depende de que el resumen del historial la recuerde.
+function withInstructions(hist, skill = activeSkill()) {
+  const sys = [];
+  if (S.instructions?.trim()) sys.push(S.instructions.trim());
+  const pr = activeProject();
+  if (pr?.memory?.trim()) sys.push(`Proyecto «${pr.name}». Información y preferencias que debes tener en cuenta:\n${pr.memory.trim()}`);
+  if (skill) sys.push(`Habilidad activa: «${skill.name}» (v${skill.version}). Sigue este procedimiento:\n\n${skill.instructions}`);
+  return sys.length ? [{ role: 'system', content: sys.join('\n\n---\n\n') }, ...hist] : hist;
+}
+// skill: la versión fijada al enviar; una sincronización durante los reintentos no la cambia.
+async function runTarget(t, hist, msg, signal, tools, sk = null) {
   const t0 = performance.now();
   msg.tools = [];
-  const out = await callTarget(t, withInstructions(hist), (x) => { msg.content = noThink(x); schedule(msg); }, signal, {
+  if (sk) msg.skill = { id: sk.id, v: sk.version, name: sk.name };
+  // A un modelo sin visión, las imágenes de mensajes anteriores le llegan como una nota de texto.
+  if (S.health[t.key]?.noVision) hist = hist.map((m) => (Array.isArray(m.content) ? { ...m, content: `${textOf(m.content)}\n[imagen adjunta, no visible para este modelo]` } : m));
+  const out = await callTarget(t, withInstructions(hist, sk), (x) => { msg.content = noThink(x); schedule(msg); }, signal, {
     tools, onTool: (rec) => { msg.tools.push(rec); schedule(msg); },
   });
   msg.content = noThink(out) || msg.content || '(respuesta vacía)';
@@ -595,13 +739,22 @@ async function send(text, files = []) {
   setBusy(true);
   const signal = abortCtl.signal;
   try {
-    let hist = await fitContext(th, buildHistory(th), S.ctxTokens, signal);
+    const skill = activeSkill() && JSON.parse(JSON.stringify(activeSkill()));
+    // El presupuesto cuenta toda la petición (instrucciones, memoria del proyecto y habilidad) y deja sitio para la respuesta.
+    const RESERVE = 800;
+    const budget = Math.max(800, S.ctxTokens - tokens(withInstructions([], skill)) - RESERVE);
+    let hist = await fitContext(th, buildHistory(th), budget, signal);
     renderLog();
     const first = findT(S.target);
+    // Solo cuenta si el mensaje actual lleva imágenes; las de mensajes anteriores se adaptan por modelo.
+    const needs = { vision: Array.isArray(hist[hist.length - 1]?.content) };
+    const queue = plan(first, needs);
+    if (first && allowed(first) && !capable(first, needs)) msgs.push({ id: uid(), role: 'assistant', label: first.label, error: '📷 no admite imágenes', skipped: true, ts: Date.now() });
+    if (first && !allowed(first)) msgs.push({ id: uid(), role: 'assistant', label: first.label, error: `⛔ ${notAllowedWhy(first)}`, skipped: true, ts: Date.now() });
     if (!first) msgs.push({ id: uid(), role: 'assistant', error: 'No hay IAs conectadas. Añade una en ⚙ o conecta un servidor en ⬡.', ts: Date.now() });
-    else if (S.council) await sendCouncil(th, hist, first, signal);
+    else if (!queue.length) msgs.push({ id: uid(), role: 'assistant', error: th.private ? 'Este hilo es 🔒 PRIVADO y no hay ninguno de tus equipos conectado (⬡).' : 'Con SOLO GRATIS activado no hay ninguna IA gratuita disponible ahora.', ts: Date.now() });
+    else if (S.council) await sendCouncil(th, hist, first, signal, needs, skill);
     else {
-      const queue = plan(first);
       let attempts = 0, ctxRetried = false;
       for (let qi = 0; qi < queue.length && attempts < MAX_ATTEMPTS; qi++) {
         const t = queue[qi];
@@ -613,7 +766,7 @@ async function send(text, files = []) {
         attempts++;
         const msg = { id: uid(), role: 'assistant', label: t.label, key: t.key, content: '', pending: true, ts: Date.now() };
         msgs.push(msg); renderLog();
-        try { await runTarget(t, hist, msg, signal, S.useTools); break; }
+        try { await runTarget(t, hist, msg, signal, S.useTools, skill); break; }
         catch (e) {
           if (isCtxErr(e) && !ctxRetried) {
             // No cabía en el contexto de este modelo: se comprime a la mitad y se reintenta con la misma IA.
@@ -637,11 +790,11 @@ async function send(text, files = []) {
 }
 
 // ---------- CONSEJO: varias IAs a la vez y una síntesis final ----------
-function councilMembers(first) {
-  const chosen = S.councilKeys.map(findT).filter((t) => t && !cooling(t.key));
+function councilMembers(first, needs = {}) {
+  const chosen = S.councilKeys.map(findT).filter((t) => t && !cooling(t.key) && allowed(t) && capable(t, needs));
   if (chosen.length >= 2) return chosen.slice(0, 5);
   const seen = new Set(), out = [];
-  for (const t of plan(first)) {
+  for (const t of plan(first, needs)) {
     if (cooling(t.key)) continue;
     const prov = t.pid || t.sid;
     if (seen.has(prov)) continue;
@@ -650,9 +803,9 @@ function councilMembers(first) {
   }
   return out;
 }
-async function sendCouncil(th, hist, first, signal) {
+async function sendCouncil(th, hist, first, signal, needs = {}, skill = null) {
   const group = uid();
-  const members = councilMembers(first);
+  const members = councilMembers(first, needs);
   const runs = members.map((t) => {
     const msg = { id: uid(), role: 'assistant', label: t.label, key: t.key, content: '', pending: true, group, ts: Date.now() };
     th.messages.push(msg);
@@ -660,17 +813,17 @@ async function sendCouncil(th, hist, first, signal) {
   });
   renderLog();
   await Promise.all(runs.map(async ({ t, msg }) => {
-    try { await runTarget(t, hist, msg, signal, S.useTools); }
+    try { await runTarget(t, hist, msg, signal, S.useTools, skill); }
     catch (e) { failMsg(msg, e, t); }
     schedule(msg);
   }));
   const good = runs.filter((r) => !r.msg.error);
   if (good.length < 2 || signal.aborted) { renderLog(); return; }
   const question = textOf(hist[hist.length - 1]?.content);
-  const prompt = [{ role: 'user', content: `Pregunta del usuario:\n${question}\n\nRespuestas de varias IAs:\n\n${good.map((r, i) => `### Respuesta ${i + 1} (${r.t.label})\n${r.msg.content}`).join('\n\n')}\n\nEscribe la mejor respuesta final para el usuario: combina lo correcto de cada una, corrige errores y, si discrepan en algo importante, indícalo brevemente. No hables de "las respuestas" ni de que eres un moderador; responde directamente.` }];
+  const prompt = [{ role: 'user', content: `Pregunta del usuario:\n${question}\n\nRespuestas de varias IAs:\n\n${good.map((r, i) => `### Respuesta ${i + 1} (${r.t.label})\n${r.msg.content}`).join('\n\n')}\n\nEscribe la mejor respuesta final para el usuario: combina lo correcto de cada una y corrige errores. No hables de "las respuestas" ni de que eres un moderador; responde directamente. Termina SIEMPRE con un apartado titulado "⚠️ Desacuerdos y puntos a comprobar" que liste en viñetas dónde discrepan las IAs o qué afirmaciones conviene verificar; si no hay ninguno, escribe "Sin desacuerdos relevantes".` }];
   const syn = { id: uid(), role: 'assistant', label: '⚖ SÍNTESIS', group, synth: true, content: '', pending: true, ts: Date.now() };
   th.messages.push(syn); renderLog();
-  const judges = [first, ...good.map((r) => r.t)].filter((t, i, a) => !cooling(t.key) && a.findIndex((x) => x.key === t.key) === i);
+  const judges = [first, ...good.map((r) => r.t)].filter((t, i, a) => !cooling(t.key) && allowed(t) && a.findIndex((x) => x.key === t.key) === i);
   for (const t of judges.slice(0, 3)) {
     syn.label = `⚖ SÍNTESIS · ${t.label}`; syn.error = null; syn.pending = true;
     try { await runTarget(t, prompt, syn, signal, false); break; }
@@ -689,8 +842,8 @@ function setBusy(b) {
 // ---------- render ----------
 const CAN_SPEAK = 'speechSynthesis' in window;
 function filesHTML(m) {
-  return (m.files || []).map((f) => (f.kind === 'image'
-    ? `<img class="thumb" src="${esc(f.data)}" alt="${esc(f.name)}">`
+  return (m.files || []).map((f) => (f.missing || f[field(f)] == null ? `<span class="chip off">⚠️ ${esc(f.name)} (no disponible)</span>`
+    : f.kind === 'image' ? `<img class="thumb" src="${esc(f.data)}" alt="${esc(f.name)}">`
     : `<span class="chip">📄 ${esc(f.name)}</span>`)).join('');
 }
 function replyHTML(m) {
@@ -701,11 +854,12 @@ function replyHTML(m) {
   }
   const tools = (m.tools || []).length ? `<div class="chips">${m.tools.map((x) => `<span class="chip tool ${x.ok ? '' : 'off'}" title="${esc(JSON.stringify(x.args ?? {}))}">ƒ ${esc(x.name)}</span>`).join('')}</div>` : '';
   const acts = m.pending ? '<span class="processing">PROCESANDO</span>'
-    : `${m.ms ? `<small class="ms">${(m.ms / 1000).toFixed(1)} s</small>` : ''}${CAN_SPEAK ? `<button data-speak="${m.id}">LEER</button>` : ''}<button data-copy="${m.id}">COPIAR</button>`;
-  return `<div class="reply ${m.pending ? 'pending' : ''} ${m.synth ? 'synth' : ''}" data-id="${m.id}"><div class="tag"><span>${esc(m.label)}</span><span class="acts">${acts}</span></div>${tools}<div class="txt">${md(m.content)}</div></div>`;
+    : `${m.ms ? `<small class="ms">${(m.ms / 1000).toFixed(1)} s</small>` : ''}${CAN_SPEAK ? `<button data-speak="${m.id}">LEER</button>` : ''}<button data-copy="${m.id}">COPIAR</button><button data-skillify="${m.id}" title="Crear una habilidad reutilizable a partir de esta respuesta">✦ HABILIDAD</button><button data-branch="${m.id}" title="Nuevo hilo con la conversación hasta aquí">⑂ RAMA</button>`;
+  const skill = m.skill ? `<span class="chip skill">✦ ${esc(m.skill.name)} · v${m.skill.v}</span>` : '';
+  return `<div class="reply ${m.pending ? 'pending' : ''} ${m.synth ? 'synth' : ''}" data-id="${m.id}"><div class="tag"><span>${esc(m.label)} ${skill}</span><span class="acts">${acts}</span></div>${tools}<div class="txt">${md(m.content)}</div></div>`;
 }
 function msgHTML(m) {
-  if (m.role === 'user') return `<div class="msg user"><div class="tag">▶ TÚ // ${hhmm(m.ts)}</div><div class="body">${esc(m.content)}${m.files?.length ? `<div class="files">${filesHTML(m)}</div>` : ''}</div></div>`;
+  if (m.role === 'user') return `<div class="msg user"><div class="tag">▶ TÚ // ${hhmm(m.ts)}<span class="acts"><button data-edit="${m.id}" title="Editar y reenviar en una rama (el original se conserva)">✎ EDITAR</button><button data-branch="${m.id}" title="Nuevo hilo con la conversación hasta aquí">⑂ RAMA</button></span></div><div class="body">${esc(m.content)}${m.files?.length ? `<div class="files">${filesHTML(m)}</div>` : ''}</div></div>`;
   return `<div class="msg">${replyHTML(m)}</div>`;
 }
 function logHTML(th) {
@@ -730,11 +884,19 @@ function renderLog() {
   const log = $('#log');
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
   const th = thread();
+  $('#private').checked = !!th.private;
+  const sk = activeSkill();
+  $('#btnSkills').textContent = sk ? `✦ ${sk.name.toUpperCase()} · v${sk.version}` : '✦ HABILIDADES';
+  $('#btnSkills').classList.toggle('on', !!sk);
+  const pr = activeProject();
+  $('#btnThreads').textContent = pr ? '📁' : '≡';
+  $('#btnThreads').title = pr ? `Hilos · proyecto ${pr.name}` : 'Hilos guardados';
   if (!th.messages.length) {
     const n = targets().length;
     log.innerHTML = `<div class="empty">
       <svg viewBox="0 0 40 46" class="biglogo" aria-hidden="true">${$('.logo').innerHTML}</svg>
       <div class="big">NEURA</div><div class="sub">ESPERANDO ENTRADA</div>
+      ${S.providers.length ? '' : wizardHTML()}
       <ol><li>${n ? `<b>${n} modelos</b> conectados.` : 'Pulsa <b>⚙</b> y añade IAs públicas con su clave gratuita (Gemini, Groq, OpenRouter…).'}</li>
       <li>Pulsa <b>⬡</b> para conectar tu IA local mediante un servidor MCP.</li>
       <li><b>AUTO-SALTO</b>: si una IA agota sus tokens gratis, contesta otra.</li>
@@ -759,15 +921,54 @@ function schedule(m) {
   });
 }
 
+// ---------- configuración guiada: la primera IA en un minuto ----------
+const WIZ = ['gemini', 'groq', 'openrouter', 'mistral', 'cerebras'];
+function wizardHTML() {
+  return `<div class="card wizard">
+    <h4>CONFIGURA TU PRIMERA IA · GRATIS, 1 MINUTO</h4>
+    <label>1. ELIGE UNA IA<select id="wzPreset">${WIZ.map((k, i) => `<option value="${k}">${PRESETS[k].name}${i ? '' : ' (recomendada)'}</option>`).join('')}</select></label>
+    <div class="hint">2. <a id="wzKey" href="${esc(PRESETS.gemini.keyUrl)}" target="_blank" rel="noopener">Abre su página y crea una clave gratuita ▸</a> (inicia sesión, pulsa «Create API key» y cópiala).</div>
+    <label>3. PEGA LA CLAVE<input id="wzApiKey" type="password" autocomplete="off" placeholder="pega aquí tu clave"></label>
+    <button class="btn wide" id="wzGo">CONECTAR Y PROBAR</button>
+    <div class="hint" id="wzMsg">La clave se guarda solo en este dispositivo.</div>
+  </div>`;
+}
+$('#log').addEventListener('change', (e) => { if (e.target.id === 'wzPreset') $('#wzKey').href = PRESETS[e.target.value].keyUrl; });
+$('#log').addEventListener('click', async (e) => {
+  if (e.target.id !== 'wzGo') return;
+  const key = $('#wzApiKey').value.trim(), k = $('#wzPreset').value, msg = $('#wzMsg');
+  if (!key) return toast('Pega la clave primero', true);
+  e.target.disabled = true; msg.textContent = 'Conectando y descargando la lista de modelos…';
+  let p = S.providers.find((x) => x.wizard);
+  if (!p) S.providers.push(p = { id: uid(), preset: k, ...JSON.parse(JSON.stringify(PRESETS[k])), enabled: true, wizard: true });
+  Object.assign(p, { preset: k, name: PRESETS[k].name, baseUrl: PRESETS[k].baseUrl, models: [...PRESETS[k].models], apiKey: key });
+  refreshed.delete(p.id); await refreshModels(p, true);
+  const t = { key: `${p.id}::${p.models[0]}`, pid: p.id, model: p.models[0], kind: p.kind };
+  try {
+    if (!p.models[0]) throw new Error('No se encontraron modelos');
+    await callTarget(t, [{ role: 'user', content: 'Responde solo: OK' }], () => {});
+    delete p.wizard; S.target = t.key; save(); renderTargets(); renderLog();
+    toast(`✓ ${p.name} conectada. ¡Ya puedes escribir!`); $('#input').focus();
+  } catch (err) {
+    msg.textContent = `No funcionó: ${friendly(err)} Revisa la clave y vuelve a intentarlo.`;
+    S.providers = S.providers.filter((x) => x !== p); save();
+    e.target.disabled = false;
+  }
+});
+
 function renderTargets() {
   const all = targets();
-  if (!all.some((t) => t.key === S.target)) S.target = all[0]?.key || null;
+  if (!all.some((t) => t.key === S.target)) {
+    const pid = String(S.target || '').split('::')[0];
+    S.target = (all.find((t) => t.pid === pid && allowed(t)) || all.find(allowed) || all[0])?.key || null;
+  }
   const sel = $('#target');
-  sel.innerHTML = all.length ? all.map((t) => `<option value="${esc(t.key)}">${cooling(t.key) ? '⏳ ' : ''}${esc(t.label)}</option>`).join('') : '<option value="">— SIN IAs CONECTADAS —</option>';
+  sel.innerHTML = all.length ? all.map((t) => `<option value="${esc(t.key)}">${!allowed(t) ? '⛔ ' : cooling(t.key) ? '⏳ ' : ''}${esc(t.label)}</option>`).join('') : '<option value="">— SIN IAs CONECTADAS —</option>';
   sel.value = S.target || '';
   $('#autoSkip').checked = S.autoSkip;
   $('#council').checked = S.council;
   $('#useTools').checked = S.useTools;
+  $('#private').checked = !!thread().private;
   const hasTools = toolbox().length > 0;
   $('#toolsLbl').hidden = !hasTools;
   if (!hasTools && S.useTools) $('#useTools').checked = false;
@@ -783,7 +984,8 @@ function healthChips(p) {
     if (!h || (!h.ok && !h.fail && !cooling(k))) return '';
     if (cooling(k)) return `<span class="chip off" title="${esc(m)}">⏳ ${esc(m)} · ${esc(coolText(k))}</span>`;
     const pct = Math.round((h.ok / Math.max(1, h.ok + h.fail)) * 100);
-    return `<span class="chip" title="${esc(m)}">● ${esc(m)} · ${(h.ms / 1000).toFixed(1)} s · ${pct}%</span>`;
+    const caps = `${h.noVision ? ' · sin imágenes' : ''}${h.noTools ? ' · sin herramientas' : ''}`;
+    return `<span class="chip" title="${esc(m)}">● ${esc(m)} · ${(h.ms / 1000).toFixed(1)} s · ${pct}%${caps}</span>`;
   }).join('');
   return chips ? `<div class="chips">${chips}</div>` : '';
 }
@@ -810,6 +1012,9 @@ function renderSettings() {
     <h3>INSTRUCCIONES PARA TODAS LAS IAs</h3>
     <textarea id="instructions" rows="3" class="wide-input" placeholder="Ej.: responde solo en español y de forma breve">${esc(S.instructions ?? '')}</textarea>
     <p class="hint">Se envían a todas las IAs en cada mensaje (idioma, tono, longitud…). Déjalo vacío para no enviar nada.</p>
+    <h3>GASTO</h3>
+    <label class="auto"><input type="checkbox" id="freeOnly" ${S.freeOnly ? 'checked' : ''}> SOLO GRATIS</label>
+    <p class="hint">Neura solo usará IAs del nivel gratuito (en OpenRouter, modelos <b>:free</b>) y tus equipos. Las de pago o de coste desconocido (⛔) no se usan ni en AUTO-SALTO, ni en CONSEJO, ni para resumir.</p>
     <h3>MEMORIA DE CONTEXTO</h3>
     <label class="field">TOKENS MÁXIMOS POR MENSAJE<input type="number" id="ctxTokens" min="1000" step="500" value="${S.ctxTokens}"></label>
     <p class="hint">Si un hilo pasa de este tamaño, Neura resume lo antiguo (con tu IA local si la tienes) y envía el resumen más lo reciente. Así las IAs gratuitas, con poco contexto, siguen respondiendo.</p>
@@ -839,7 +1044,8 @@ function renderMcp() {
       ${(s.tools || []).length ? `<div class="chips">${s.tools.map((t) => `<span class="chip tool" title="${esc(t.description || '')}">ƒ ${esc(t.name)}</span>`).join('')}</div>` : ''}
       ${(s.tools || []).some((t) => t.name === 'threads_sync') ? `<label class="auto"><input type="checkbox" data-act="sync" ${s.sync !== false ? 'checked' : ''}> SINCRONIZAR HILOS
         <span class="mono">${s.syncError ? `<span class="red">${esc(s.syncError)}</span>` : s.syncedAt ? '· ' + hhmm(s.syncedAt) : ''}</span></label>` : ''}
-      ${!trusted(s) && (s.tools || []).some((t) => !INTERNAL.has(t.name)) ? `<label class="auto"><input type="checkbox" data-act="trust" ${s.trustTools ? 'checked' : ''}> USAR SUS HERRAMIENTAS SIN PREGUNTAR</label>` : ''}
+      ${!s.local && (s.tools || []).some((t) => !INTERNAL.has(t.name)) ? `<label class="auto"><input type="checkbox" data-act="trust" ${s.trustTools ? 'checked' : ''}> USAR SUS HERRAMIENTAS SIN PREGUNTAR</label>` : ''}
+      ${!s.local ? `<label class="auto"><input type="checkbox" data-act="mine" ${s.mine ? 'checked' : ''}> ES UN EQUIPO MÍO (sirve para hilos 🔒 PRIVADOS)</label>` : ''}
       ${s.local && DESK ? localBridgeHTML() : ''}
       <div class="row"><button class="btn sm" data-act="reconnect">RECONECTAR</button>${s.local ? '' : '<button class="btn sm red" data-act="del">ELIMINAR</button>'}</div>
     </div>`;
@@ -856,7 +1062,7 @@ function localBridgeHTML() {
     <label class="auto"><input type="checkbox" data-act="lan" ${b.lan ? 'checked' : ''}> ABRIR A MI RED</label>
     ${b.lan ? `${b.qr ? `<div class="qr"><img src="${esc(b.qr)}" alt="Código QR de emparejamiento"><span class="hint">Escanéalo con la cámara del móvil: se abre Neura ya conectada a este PC. En la app instalada: ⬡ → 📷 ESCANEAR QR.</span></div>` : ''}
       <div class="mono">URL: ${urls.map(esc).join(' · ') || 'sin red'}</div>
-      <div class="mono">TOKEN: <span class="secret">${esc(b.token)}</span> <button class="btn sm ghost" data-act="copytoken">COPIAR</button></div>`
+      <div class="mono">TOKEN: <span class="secret">${esc(b.token)}</span> <button class="btn sm ghost" data-act="copytoken">COPIAR</button> <button class="btn sm red" data-act="regentoken" title="Si pierdes el móvil o se filtra el QR">REGENERAR</button></div>`
       : '<div class="mono">Solo accesible desde este PC.</div>'}
     <h4>🌍 FUERA DE CASA (Tailscale)</h4>
     ${!ts.installed ? '<div class="hint">Instala Tailscale (gratis) en el PC y el móvil para usar Neura y tu IA local desde cualquier sitio. <a href="https://tailscale.com/download" target="_blank" rel="noopener">▸ descargar</a></div>'
@@ -881,14 +1087,25 @@ function toast(m, err) {
 
 // ---------- hilos: lista, búsqueda, exportar e importar ----------
 const norm = (s) => String(s || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
-function renderThreads() {
+function renderThreads(withCard = true) {
   const sv = S.mcp.filter(canSync);
   $('#syncInfo').innerHTML = sv.length
     ? `⇄ Sincronizado con ${sv.map((s) => `<b>${esc(s.name)}</b>`).join(', ')}: los mismos hilos en el PC, el móvil y la web.`
     : 'Se guardan en este dispositivo. Para tener los mismos hilos en el PC y el móvil, conéctalos al mismo puente en <b>⬡</b>.';
+  const projects = S.projects.filter((p) => !p.deleted);
+  if (S.project && !projects.some((p) => p.id === S.project)) S.project = null;
+  const pr = projects.find((p) => p.id === S.project);
+  $('#projectSel').innerHTML = `<option value="">TODOS LOS HILOS</option>${projects.map((p) => `<option value="${p.id}">📁 ${esc(p.name)}</option>`).join('')}<option value="__new">+ NUEVO PROYECTO…</option>`;
+  $('#projectSel').value = S.project || '';
+  if (withCard) $('#projectCard').innerHTML = pr ? `<div class="card">
+      <label>NOMBRE DEL PROYECTO<input id="prName" value="${esc(pr.name)}" maxlength="80"></label>
+      <label>MEMORIA DEL PROYECTO (la reciben todas las IAs en sus hilos)<textarea id="prMemory" rows="4" placeholder="Datos, contexto y preferencias: p. ej. «Tesis sobre energía solar, estilo académico, citar fuentes»">${esc(pr.memory || '')}</textarea></label>
+      <label>HABILIDAD POR DEFECTO EN SUS HILOS NUEVOS<select id="prSkill"><option value="">— ninguna —</option>${liveSkills().map((k) => `<option value="${k.id}" ${pr.skill === k.id ? 'selected' : ''}>✦ ${esc(k.name)}</option>`).join('')}</select></label>
+      <div class="row wrap">${thread().project !== pr.id ? '<button class="btn sm" id="prAdd">AÑADIR EL HILO ACTUAL</button>' : ''}<button class="btn sm red" id="prDel">BORRAR PROYECTO</button></div>
+    </div>` : '';
   const q = norm($('#threadSearch').value.trim());
   const rows = [];
-  for (const t of S.threads.filter((x) => !x.deleted && (x.messages.length || x.id === S.active)).sort((a, b) => b.ts - a.ts)) {
+  for (const t of S.threads.filter((x) => !x.deleted && (x.messages.length || x.id === S.active) && (!S.project || x.project === S.project)).sort((a, b) => b.ts - a.ts)) {
     let snip = '';
     if (q) {
       if (!norm(t.title).includes(q)) {
@@ -898,7 +1115,8 @@ function renderThreads() {
         snip = `<em class="snip">…${esc(c.slice(Math.max(0, k - 40), k))}<mark>${esc(c.slice(k, k + q.length))}</mark>${esc(c.slice(k + q.length, k + q.length + 60))}…</em>`;
       }
     }
-    rows.push(`<div class="chatItem ${t.id === S.active ? 'on' : ''}" data-tid="${t.id}"><span>${esc(t.title)}${snip}</span><small>${new Date(t.ts).toLocaleDateString()}</small><button class="btn sm red" data-del="${t.id}" aria-label="Borrar hilo">✕</button></div>`);
+    const tp = !S.project && t.project && projects.find((p) => p.id === t.project);
+    rows.push(`<div class="chatItem ${t.id === S.active ? 'on' : ''}" data-tid="${t.id}"><span>${tp ? `<small class="proj">📁 ${esc(tp.name)}</small> ` : ''}${esc(t.title)}${snip}</span><small>${new Date(t.ts).toLocaleDateString()}</small><button class="btn sm red" data-del="${t.id}" aria-label="Borrar hilo">✕</button></div>`);
   }
   $('#threadList').innerHTML = rows.join('') || `<p class="hint">${q ? 'Nada coincide con la búsqueda.' : ''}</p>`;
 }
@@ -927,14 +1145,14 @@ async function importThreads(file) {
     const list = Array.isArray(data) ? data : data.threads;
     if (!Array.isArray(list)) throw new Error('No es una copia de Neura');
     let n = 0;
-    for (const t of list) {
+    for (const t of portable(list)) {
       if (!t?.id || !Array.isArray(t.messages)) continue;
       t.messages.forEach((m) => { m.id ||= uid() + uid(); });
       const i = S.threads.findIndex((x) => x.id === t.id);
       if (i >= 0) S.threads[i] = mergeThread(S.threads[i], t); else S.threads.push(t);
       n++;
     }
-    save(); renderThreads(); syncAll();
+    save(); await persistFiles(); renderThreads(); renderLog(); syncAll();
     toast(`${n} hilos importados`);
   } catch (e) { toast('Importar: ' + e.message, true); }
 }
@@ -948,23 +1166,50 @@ async function shrink(file, max = 1280) {
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', 0.85);
 }
-async function pdfText(file) {
+// Texto con marcas de página (para citar «pág. N»). Si es escaneado (sin texto), devuelve las primeras
+// páginas como imágenes para que las lea una IA con visión.
+const PDF_SCAN_PAGES = 5;
+async function readPdf(file) {
   const pdfjs = await import('./vendor/pdf.min.js');
   pdfjs.GlobalWorkerOptions.workerSrc = new URL('vendor/pdf.worker.min.js', location.href).href;
   const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
-  let out = '';
+  let out = '', chars = 0;
   for (let i = 1; i <= Math.min(doc.numPages, 100) && out.length < 60000; i++) {
     const c = await (await doc.getPage(i)).getTextContent();
-    out += c.items.map((x) => x.str + (x.hasEOL ? '\n' : ' ')).join('') + '\n\n';
+    const t = c.items.map((x) => x.str + (x.hasEOL ? '\n' : ' ')).join('').trim();
+    chars += t.length;
+    out += `--- pág. ${i} ---\n${t}\n\n`;
   }
-  if (!out.trim()) throw new Error('el PDF no tiene texto (¿es escaneado?)');
-  return out.slice(0, 60000);
+  if (chars) return { text: out.slice(0, 60000), pages: doc.numPages };
+  const images = [];
+  for (let i = 1; i <= Math.min(doc.numPages, PDF_SCAN_PAGES); i++) {
+    const page = await doc.getPage(i);
+    const vp0 = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: Math.min(2, 1400 / Math.max(vp0.width, vp0.height)) });
+    const c = document.createElement('canvas');
+    c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    images.push(c.toDataURL('image/jpeg', 0.8));
+  }
+  return { images, pages: doc.numPages };
 }
 async function addFiles(list) {
+  const before = attach.length;
+  try { await addFilesRaw(list); }
+  finally { for (const f of attach.slice(before)) { try { await storeFile(f); } catch (e) { storageWarn(e); } } }
+}
+async function addFilesRaw(list) {
   for (const f of list) {
     try {
       if (f.type.startsWith('image/')) attach.push({ kind: 'image', name: f.name, data: await shrink(f) });
-      else if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) { toast('Leyendo PDF…'); attach.push({ kind: 'text', name: f.name, text: await pdfText(f) }); }
+      else if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) {
+        toast('Leyendo PDF…');
+        const r = await readPdf(f);
+        if (r.text) attach.push({ kind: 'text', name: f.name, text: r.text, pdf: true });
+        else {
+          r.images.forEach((data, i) => attach.push({ kind: 'image', name: `${f.name} · pág. ${i + 1}`, data }));
+          toast(`PDF escaneado: se enviarán ${r.images.length} página(s) como imagen${r.pages > r.images.length ? ` (de ${r.pages})` : ''}. Usa una IA con visión (p. ej. Gemini).`);
+        }
+      }
       else {
         if (f.size > 5e6) throw new Error('demasiado grande (máx. 5 MB)');
         const t = await f.text();
@@ -983,7 +1228,7 @@ function renderAttach() {
 // ---------- voz: dictado y lectura en voz alta ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null;
-const sttProvider = () => S.providers.find((p) => p.enabled !== false && p.apiKey && PRESETS[p.preset]?.stt);
+const sttProvider = () => S.providers.find((p) => p.enabled !== false && p.apiKey && PRESETS[p.preset]?.stt && (!S.freeOnly || p.tier === 'free'));
 async function multipart(fields, filename, blob) {
   const b = '----neura' + uid() + uid(), enc = new TextEncoder(), parts = [];
   for (const [k, v] of Object.entries(fields)) parts.push(enc.encode(`--${b}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
@@ -1012,6 +1257,8 @@ function insertText(t) {
 const micUI = (on) => { $('#mic').classList.toggle('rec', on); $('#mic').setAttribute('aria-pressed', on); };
 async function toggleMic() {
   if (rec) { rec.stop(); return; }
+  // El dictado envía la voz a un servicio externo (Groq/OpenAI o el del navegador): no en hilos privados.
+  if (thread().private) return toast('🔒 Hilo privado: el dictado enviaría tu voz a un servicio externo, así que está desactivado', true);
   const p = sttProvider();
   if (!p && SR) {
     // Sin clave de Groq/OpenAI: dictado del propio navegador.
@@ -1066,8 +1313,9 @@ function parsePair(text) {
 }
 function pairWith(p) {
   let s = S.mcp.find((x) => x.url === p.url);
-  if (s) Object.assign(s, { token: p.token });
-  else S.mcp.push(s = { id: uid(), name: p.name, url: p.url, token: p.token, models: [], tools: [] });
+  // Lo emparejaste tú con el QR de tu PC: es un equipo tuyo y de confianza.
+  if (s) Object.assign(s, { token: p.token, mine: true, trustTools: true });
+  else S.mcp.push(s = { id: uid(), name: p.name, url: p.url, token: p.token, models: [], tools: [], mine: true, trustTools: true });
   save(); mcpConnect(s);
   toast(`Emparejando con ${s.name}…`);
 }
@@ -1089,6 +1337,180 @@ async function scanQR() {
   }
 }
 function stopScan() { scanStream?.getTracks().forEach((t) => t.stop()); scanStream = null; $('#scan').hidden = true; }
+
+// ---------- habilidades (skills): procedimientos reutilizables con cualquier IA ----------
+// Formato de intercambio: SKILL.md de Agent Skills (frontmatter name/description + instrucciones).
+// Solo texto: una habilidad no concede permisos ni ejecuta nada; importarla tampoco.
+const slug = (s) => norm(s).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 64) || 'habilidad';
+function parseSkillMd(text) {
+  const t = String(text).replace(/^\uFEFF/, '').trim().replace(/^```[\w-]*\n([\s\S]*?)\n```$/, '$1').trim();
+  const m = t.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+  if (!m) return { name: '', description: '', instructions: t };
+  // Frontmatter YAML simple: «clave: valor», bloques «>» (une con espacios) y «|» (conserva saltos)
+  // y continuaciones sangradas. shortcut: sin listas ni objetos anidados, que Agent Skills no usa en name/description.
+  const fm = {};
+  let key = null, mode = '';
+  for (const l of m[1].split('\n')) {
+    const kv = l.match(/^([\w-]+):\s*(.*)$/);
+    if (kv) {
+      key = kv[1]; const v = kv[2].trim();
+      mode = /^[>|][+-]?$/.test(v) ? v[0] : ' ';
+      fm[key] = mode === ' ' ? v.replace(/^["']|["']$/g, '') : '';
+    } else if (key && /^\s+\S/.test(l)) fm[key] += (fm[key] ? (mode === '|' ? '\n' : ' ') : '') + l.trim();
+  }
+  return { name: fm.name || '', description: (fm.description || '').trim(), instructions: m[2].trim() };
+}
+const skillMd = (k) => `---\nname: ${slug(k.name)}\ndescription: ${String(k.description).replace(/\n/g, ' ')}\n---\n\n${k.instructions}\n`;
+let skDraft = null; // { id?, name, description, instructions, mode: 'goal' | 'edit' }
+function renderSkills() {
+  const act = activeSkill();
+  $('#skillList').innerHTML = liveSkills().map((k) => `
+    <div class="card ${act?.id === k.id ? 'skill-on' : ''}" data-kid="${k.id}">
+      <div class="head"><b class="srv">✦ ${esc(k.name)}</b><span class="badge local">v${k.version}</span>${act?.id === k.id ? '<span class="badge on">ACTIVA EN ESTE HILO</span>' : ''}</div>
+      <div class="hint">${esc(k.description)}</div>
+      <div class="row wrap">${act?.id === k.id ? '<button class="btn sm ghost" data-sk="off">QUITAR DE ESTE HILO</button>' : '<button class="btn sm" data-sk="use">USAR EN ESTE HILO</button>'}
+        <button class="btn sm ghost" data-sk="edit">EDITAR</button><button class="btn sm ghost" data-sk="export">EXPORTAR</button><button class="btn sm red" data-sk="del">✕</button></div>
+    </div>`).join('') || '<p class="hint">Aún no tienes habilidades. Crea una con IA, en blanco, o importa un SKILL.md.</p>';
+  const d = skDraft, ed = $('#skEditor');
+  if (!d) { ed.innerHTML = ''; return; }
+  ed.innerHTML = d.mode === 'goal' ? `<div class="card">
+      <h4>CREAR CON IA</h4>
+      <label>¿QUÉ QUIERES QUE HAGA?<textarea id="skGoal" rows="3" placeholder="Ej.: convierte mis apuntes en un resumen y 5 preguntas de repaso">${esc(d.goal || '')}</textarea></label>
+      <label>EJEMPLO (opcional)<textarea id="skExample" rows="2" placeholder="Una entrada típica o cómo quieres el resultado">${esc(d.example || '')}</textarea></label>
+      <div class="row"><button class="btn" id="skGen">GENERAR BORRADOR</button><button class="btn sm ghost" id="skCancel">CANCELAR</button></div>
+    </div>` : `<div class="card">
+      <h4>${d.id ? 'EDITAR HABILIDAD' : 'REVISA EL BORRADOR'}</h4>
+      ${(() => { const k = d.id && S.skills.find((x) => x.id === d.id); return k?.history?.length ? `<div class="hint">Versiones anteriores: ${k.history.slice().reverse().map((h) => `<button type="button" class="btn sm ghost" data-restore="${h.version}" title="${esc(new Date(h.ts).toLocaleString())}">v${h.version}</button>`).join(' ')} · cargar una la guarda como versión nueva</div>` : ''; })()}
+      <label>NOMBRE<input id="skName" value="${esc(d.name)}" maxlength="64"></label>
+      <label>CUÁNDO USARLA<input id="skDesc" value="${esc(d.description)}" maxlength="1024"></label>
+      <label>INSTRUCCIONES<textarea id="skInstr" rows="10">${esc(d.instructions)}</textarea></label>
+      <p class="hint" id="skSize"></p>
+      <label>PROBAR CON UNA ENTRADA<textarea id="skSample" rows="2" placeholder="Pega un texto de ejemplo">${esc(d.sample || '')}</textarea></label>
+      <div class="row wrap"><button class="btn sm ghost" id="skTest">PROBAR</button><button class="btn" id="skSave">GUARDAR${d.id ? ' NUEVA VERSIÓN' : ''}</button><button class="btn sm ghost" id="skCancel">CANCELAR</button></div>
+      <div id="skResult"></div>
+    </div>`;
+  skSize();
+}
+function skSize() {
+  const el = $('#skInstr'); if (!el) return;
+  const t = Math.ceil(el.value.length / 3.5);
+  $('#skSize').textContent = `≈ ${t} tokens en cada mensaje${t > 1200 ? ' · es larga: las IAs gratuitas con poco contexto lo notarán' : ''}`;
+}
+const readDraft = () => Object.assign(skDraft, { name: $('#skName').value.trim(), description: $('#skDesc').value.trim(), instructions: $('#skInstr').value.trim(), sample: $('#skSample').value });
+const SK_FORMAT = 'Responde SOLO con el archivo SKILL.md, sin explicaciones ni bloques de código, con este formato exacto:\n---\nname: nombre-en-minusculas-con-guiones\ndescription: Qué hace y cuándo usarla, en una o dos frases.\n---\n\n# Título\n\nInstrucciones en pasos numerados, formato de la respuesta y qué hacer si falta información. No inventes herramientas, archivos ni capacidades. En español, máximo 300 palabras.';
+async function draftSkill(prompt, btn) {
+  btn.disabled = true; btn.textContent = 'GENERANDO…';
+  try {
+    const { text, t } = await ask([{ role: 'system', content: 'Diseñas habilidades (skills) reutilizables para asistentes de IA en formato SKILL.md de Agent Skills.' }, { role: 'user', content: prompt }]);
+    const p = parseSkillMd(text);
+    if (!p.instructions) throw new Error('la IA no devolvió instrucciones');
+    skDraft = { mode: 'edit', name: p.name.replace(/-/g, ' ') || 'Nueva habilidad', description: p.description, instructions: p.instructions };
+    renderSkills(); toast(`Borrador creado con ${t.label}: revísalo y pruébalo`);
+  } catch (e) { toast('Crear habilidad: ' + netHint(e), true); btn.disabled = false; btn.textContent = 'GENERAR BORRADOR'; }
+}
+// Desde una buena respuesta: se extrae el procedimiento y se quitan los datos particulares.
+function skillFromReply(id) {
+  const msgs = thread().messages, i = msgs.findIndex((m) => m.id === id);
+  const user = [...msgs.slice(0, i)].reverse().find((m) => m.role === 'user');
+  const convo = `USUARIO: ${textOf(userContent(user || {}, false))}\n\nIA: ${msgs[i].content}`.slice(0, 8000);
+  openSheet('#sheetSkills');
+  skDraft = { mode: 'goal' }; renderSkills();
+  draftSkill(`Esta conversación salió bien. Extrae el procedimiento reutilizable como una habilidad para repetirlo con otros datos. Sustituye los datos particulares (nombres, rutas, cifras, claves) por descripciones genéricas; no copies el contenido concreto.\n\n${convo}\n\n${SK_FORMAT}`, $('#skGen'));
+}
+// Sugerencia mientras escribes: si el mensaje encaja con una habilidad, se propone; nunca se activa en silencio.
+const STOP = new Set('para como cuando este esta esto estos estas sobre desde hasta entre pero porque donde quiero puedes hacer hace usar usarla texto cosas'.split(' '));
+const words = (t) => new Set(norm(t).split(/[^a-z0-9ñ]+/).filter((x) => x.length > 3 && !STOP.has(x)));
+function suggestSkill(text) {
+  const th = thread();
+  if (th.skill || text.trim().length < 8) return null;
+  const w = [...words(text)];
+  let best = null, bestN = 0;
+  for (const k of liveSkills()) {
+    if ((th.noSuggest || []).includes(k.id)) continue;
+    // Coincidencia por raíz (5 letras) para que "apunte" encaje con "apuntes" y "resumir" con "resumen".
+    const n = [...words(`${k.name} ${k.description}`)].filter((x) => w.some((y) => y.slice(0, 5) === x.slice(0, 5))).length;
+    if (n > bestN) { bestN = n; best = k; }
+  }
+  return bestN >= 2 ? best : null;
+}
+let hintT;
+function renderSkillHint() {
+  const k = suggestSkill($('#input').value), el = $('#skillHint');
+  el.hidden = !k;
+  if (k) { el.dataset.kid = k.id; el.innerHTML = `✦ ¿Usar la habilidad <b>${esc(k.name)}</b> en este hilo? <button type="button" class="btn sm" data-hint="use">USAR</button><button type="button" class="btn sm ghost" data-hint="no">NO</button>`; }
+}
+$('#input').addEventListener('input', () => { clearTimeout(hintT); hintT = setTimeout(renderSkillHint, 300); });
+$('#skillHint').addEventListener('click', (e) => {
+  const act = e.target.dataset.hint; if (!act) return;
+  const th = thread(), id = $('#skillHint').dataset.kid;
+  if (act === 'use') th.skill = id; else th.noSuggest = [...(th.noSuggest || []), id];
+  th.ts = Date.now(); save(); renderLog(); renderSkillHint(); input.focus();
+});
+$('#btnSkills').onclick = () => { renderSkills(); openSheet('#sheetSkills'); };
+$('#skNew').onclick = () => { skDraft = { mode: 'goal' }; renderSkills(); $('#skGoal').focus(); };
+$('#skBlank').onclick = () => { skDraft = { mode: 'edit', name: '', description: '', instructions: '' }; renderSkills(); $('#skName').focus(); };
+$('#skImport').onclick = () => $('#skFile').click();
+$('#skFile').onchange = async (e) => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  if (f.size > 100e3) return toast('SKILL.md demasiado grande (máx. 100 KB)', true);
+  const p = parseSkillMd(await f.text());
+  // Se importa como borrador para revisarlo antes de guardar: el contenido de terceros no es de confianza.
+  skDraft = { mode: 'edit', name: p.name.replace(/-/g, ' ') || f.name.replace(/\.md$/i, ''), description: p.description, instructions: p.instructions };
+  renderSkills(); toast('Revisa la habilidad importada antes de guardarla');
+};
+$('#skEditor').addEventListener('input', (e) => { if (e.target.id === 'skInstr') skSize(); });
+$('#skEditor').addEventListener('click', async (e) => {
+  const id = e.target.id;
+  if (id === 'skCancel') { skDraft = null; renderSkills(); }
+  const rv = e.target.dataset.restore;
+  if (rv) {
+    const h = S.skills.find((x) => x.id === skDraft.id)?.history?.find((x) => String(x.version) === rv);
+    if (h) { Object.assign(skDraft, { name: h.name, description: h.description, instructions: h.instructions }); renderSkills(); toast(`v${h.version} cargada: pulsa GUARDAR para restaurarla`); }
+  }
+  if (id === 'skGen') {
+    const goal = $('#skGoal').value.trim(), ex = $('#skExample').value.trim();
+    if (!goal) return toast('Describe qué quieres que haga', true);
+    Object.assign(skDraft, { goal, example: ex });
+    draftSkill(`Crea una habilidad para: ${goal}${ex ? `\n\nEjemplo: ${ex}` : ''}\n\n${SK_FORMAT}`, e.target);
+  }
+  if (id === 'skTest') {
+    const d = readDraft();
+    if (!d.instructions || !d.sample.trim()) return toast('Escribe las instrucciones y una entrada de prueba', true);
+    e.target.disabled = true; e.target.textContent = 'PROBANDO…';
+    try {
+      const { text, t } = await ask(withInstructions([{ role: 'user', content: d.sample }], { name: d.name || 'borrador', version: 'prueba', instructions: d.instructions }));
+      $('#skResult').innerHTML = `<div class="reply"><div class="tag"><span>PRUEBA · ${esc(t.label)}</span></div><div class="txt">${md(text)}</div></div>`;
+    } catch (err) { toast('Prueba: ' + netHint(err), true); }
+    e.target.disabled = false; e.target.textContent = 'PROBAR';
+  }
+  if (id === 'skSave') {
+    const d = readDraft();
+    if (!d.name || !d.instructions) return toast('La habilidad necesita nombre e instrucciones', true);
+    const k = d.id && S.skills.find((x) => x.id === d.id);
+    if (k) {
+      const changed = k.name !== d.name || k.description !== d.description || k.instructions !== d.instructions;
+      // Las versiones anteriores se guardan sin cambios para poder consultarlas o restaurarlas.
+      if (changed) k.history = [...(k.history || []), { version: k.version, name: k.name, description: k.description, instructions: k.instructions, ts: k.updatedAt }].slice(-20);
+      Object.assign(k, { name: d.name, description: d.description, instructions: d.instructions, version: k.version + (changed ? 1 : 0), updatedAt: Date.now() });
+    } else S.skills.push({ id: uid() + uid(), name: d.name, description: d.description, instructions: d.instructions, version: 1, updatedAt: Date.now() });
+    skDraft = null; save(); renderSkills(); renderLog(); syncAll(); toast('HABILIDAD GUARDADA');
+  }
+});
+$('#skillList').addEventListener('click', (e) => {
+  const act = e.target.dataset.sk, card = e.target.closest('[data-kid]'); if (!act || !card) return;
+  const k = S.skills.find((x) => x.id === card.dataset.kid), th = thread();
+  if (act === 'use' || act === 'off') { th.skill = act === 'use' ? k.id : null; th.ts = Date.now(); save(); renderLog(); syncAll(); if (act === 'use') { closeSheets(); toast(`✦ ${k.name} activa en este hilo`); } }
+  if (act === 'edit') { skDraft = { mode: 'edit', id: k.id, name: k.name, description: k.description, instructions: k.instructions }; }
+  if (act === 'export') download(`SKILL-${slug(k.name)}.md`, skillMd(k), 'text/markdown');
+  if (act === 'del') {
+    if (!confirm(`¿Borrar la habilidad «${k.name}»?`)) return;
+    // Se marca como borrada (no se quita) para que el borrado llegue a los demás dispositivos.
+    Object.assign(k, { deleted: true, instructions: '', updatedAt: Date.now() });
+    save(); renderLog(); syncAll();
+  }
+  renderSkills();
+});
 
 // ---------- PIN: claves cifradas con AES-GCM ----------
 const vault = { key: null, locked: !!S.vault, sealed: '', timer: null };
@@ -1156,8 +1578,39 @@ $('#threadSearch').oninput = () => renderThreads();
 $('#newThread').onclick = () => {
   if (busy) return toast('Espera a que termine la respuesta');
   if (thread().messages.length) S.active = null;
-  thread(); save(); renderLog(); closeSheets();
+  // Si el hilo actual está vacío se reutiliza, pero empieza limpio: solo hereda lo del proyecto.
+  const th = thread(), pr = S.projects.find((p) => p.id === S.project && !p.deleted);
+  Object.assign(th, { project: pr?.id || null, skill: pr?.skill || null, private: false, noSuggest: [] });
+  save(); renderLog(); closeSheets();
 };
+$('#projectSel').onchange = (e) => {
+  if (e.target.value === '__new') {
+    // Sin prompt(): no existe en la app de PC. Se crea y se escribe el nombre en su tarjeta.
+    const p = { id: uid() + uid(), name: 'Proyecto nuevo', memory: '', skill: null, updatedAt: Date.now() };
+    S.projects.push(p); S.project = p.id; syncAll();
+  } else S.project = e.target.value || null;
+  save(); renderThreads();
+  if (e.target.value === '__new') { $('#prName').select(); $('#prName').focus(); }
+};
+$('#projectCard').addEventListener('change', (e) => {
+  const pr = S.projects.find((p) => p.id === S.project); if (!pr) return;
+  if (e.target.id === 'prName' && e.target.value.trim()) pr.name = e.target.value.trim();
+  if (e.target.id === 'prMemory') pr.memory = e.target.value;
+  if (e.target.id === 'prSkill') pr.skill = e.target.value || null;
+  // Sin redibujar la tarjeta: el campo que se está editando sigue en su sitio.
+  pr.updatedAt = Date.now(); save(); renderThreads(false); renderLog(); syncAll();
+  toast('PROYECTO GUARDADO');
+});
+$('#projectCard').addEventListener('click', (e) => {
+  const pr = S.projects.find((p) => p.id === S.project); if (!pr) return;
+  if (e.target.id === 'prAdd') { const th = thread(); Object.assign(th, { project: pr.id, ts: Date.now() }); if (!th.skill && pr.skill) th.skill = pr.skill; }
+  if (e.target.id === 'prDel') {
+    if (!confirm(`¿Borrar el proyecto «${pr.name}»? Sus hilos se conservan, sin proyecto.`)) return;
+    Object.assign(pr, { deleted: true, memory: '', updatedAt: Date.now() });
+    S.project = null;
+  }
+  save(); renderThreads(); renderLog(); syncAll();
+});
 $('#threadList').addEventListener('click', (e) => {
   if (busy) return toast('Espera a que termine la respuesta');
   const del = e.target.dataset.del;
@@ -1172,8 +1625,9 @@ $('#threadList').addEventListener('click', (e) => {
   S.active = it.dataset.tid; save(); renderLog(); closeSheets();
 });
 $('#exportMd').onclick = () => { const th = thread(); if (!th.messages.length) return toast('El hilo está vacío', true); download(`${safeName(th.title)}.md`, threadMd(th), 'text/markdown'); };
+document.addEventListener('click', (e) => { if (e.target.id === 'saveWarnExport') $('#exportAll').click(); });
 $('#exportAll').onclick = () => download(`neura-hilos-${new Date().toISOString().slice(0, 10)}.json`,
-  JSON.stringify({ app: 'neura', version: 2, exported: new Date().toISOString(), threads: S.threads.filter((t) => !t.deleted && t.messages.length) }, null, 1), 'application/json');
+  JSON.stringify({ app: 'neura', version: 2, exported: new Date().toISOString(), threads: portable(S.threads.filter((t) => !t.deleted && t.messages.length)) }, null, 1), 'application/json');
 $('#importBtn').onclick = () => $('#importFile').click();
 $('#importFile').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importThreads(f); };
 document.querySelectorAll('.sheet').forEach((s) => s.addEventListener('click', (e) => { if (e.target === s || e.target.closest('.close')) closeSheets(); }));
@@ -1182,6 +1636,12 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeShe
 $('#target').onchange = (e) => { S.target = e.target.value; save(); };
 $('#autoSkip').onchange = (e) => { S.autoSkip = e.target.checked; save(); };
 $('#council').onchange = (e) => { S.council = e.target.checked; save(); if (S.council) toast(`⚖ CONSEJO: ${councilMembers(findT(S.target)).length} IAs responderán a la vez`); };
+$('#private').onchange = (e) => {
+  const th = thread();
+  th.private = e.target.checked; th.ts = Date.now();
+  save(); renderTargets(); syncAll();
+  if (th.private) toast('🔒 HILO PRIVADO: solo responderán tus equipos (⬡)');
+};
 $('#useTools').onchange = (e) => { S.useTools = e.target.checked; save(); if (S.useTools) toast(`ƒ ${toolbox().length} herramientas disponibles para la IA`); };
 
 const input = $('#input');
@@ -1198,7 +1658,7 @@ $('#composer').onsubmit = (e) => {
   if (busy) { abortCtl?.abort(); return; }
   const text = input.value.trim();
   if (!text && !attach.length) return;
-  const files = attach; attach = []; renderAttach();
+  const files = attach; attach = []; renderAttach(); $('#skillHint').hidden = true;
   input.value = ''; input.style.height = 'auto';
   send(text, files);
 };
@@ -1210,8 +1670,23 @@ $('#mic').onclick = toggleMic;
 $('#app').addEventListener('dragover', (e) => e.preventDefault());
 $('#app').addEventListener('drop', (e) => { e.preventDefault(); if (e.dataTransfer.files.length) addFiles([...e.dataTransfer.files]); });
 $('#log').addEventListener('click', (e) => {
-  const { copy, speak: sp } = e.target.dataset || {};
+  const { copy, speak: sp, skillify } = e.target.dataset || {};
   if (sp) return speak(sp);
+  if (skillify) return skillFromReply(skillify);
+  const { branch: br, edit } = e.target.dataset || {};
+  if (br || edit) {
+    if (busy) return toast('Espera a que termine la respuesta', true);
+    const src = thread(), i = src.messages.findIndex((m) => m.id === (br || edit));
+    if (i < 0) return;
+    const orig = src.messages[i];
+    // La rama copia el hilo hasta ese mensaje (incluido en ⑂, excluido en ✎) con ids nuevos; el original no cambia.
+    const copy = src.messages.slice(0, edit ? i : i + 1).map((m) => ({ ...JSON.parse(JSON.stringify(m)), id: uid() + uid() }));
+    const th = { id: uid(), title: `⑂ ${src.title}`.slice(0, 60), messages: copy, ts: Date.now(), project: src.project || null, skill: src.skill || null, private: !!src.private };
+    S.threads.unshift(th); S.active = th.id;
+    if (edit) { input.value = orig.content || ''; input.dispatchEvent(new Event('input')); attach = (orig.files || []).map((f) => ({ ...f })); renderAttach(); input.focus(); }
+    save(); renderLog(); syncAll();
+    toast(edit ? '✎ Rama creada: edita el mensaje y envíalo' : '⑂ Rama creada a partir de ese mensaje');
+  }
   if (!copy) return;
   const m = thread().messages.find((x) => x.id === copy);
   navigator.clipboard?.writeText(m?.content || '').then(() => toast('COPIADO'), () => toast('No se pudo copiar', true));
@@ -1255,6 +1730,7 @@ $('#provList').addEventListener('click', async (e) => {
 });
 $('#settings').addEventListener('change', (e) => {
   if (e.target.id === 'ctxTokens') { S.ctxTokens = Math.max(1000, +e.target.value || 6000); save(); }
+  if (e.target.id === 'freeOnly') { S.freeOnly = e.target.checked; save(); renderTargets(); }
   if (e.target.id === 'instructions') { S.instructions = e.target.value; save(); toast('INSTRUCCIONES GUARDADAS'); }
   const k = e.target.dataset.council;
   if (k) { S.councilKeys = e.target.checked ? [...new Set([...S.councilKeys, k])] : S.councilKeys.filter((x) => x !== k); save(); }
@@ -1299,6 +1775,7 @@ $('#mcpList').addEventListener('change', async (e) => {
   const s = S.mcp.find((x) => x.id === card.dataset.sid);
   if (act === 'sync') { s.sync = e.target.checked; save(); syncWith(s); }
   if (act === 'trust') { s.trustTools = e.target.checked; save(); }
+  if (act === 'mine') { s.mine = e.target.checked; save(); renderTargets(); }
   if (act === 'lan') {
     e.target.disabled = true;
     await DESK.setLan(e.target.checked);
@@ -1310,6 +1787,13 @@ $('#mcpList').addEventListener('click', async (e) => {
   const act = e.target.dataset.act, card = e.target.closest('[data-sid]'); if (!act || !card) return;
   const s = S.mcp.find((x) => x.id === card.dataset.sid);
   if (act === 'copytoken') navigator.clipboard?.writeText(DESK.bridge().token).then(() => toast('TOKEN COPIADO'));
+  if (act === 'regentoken') {
+    if (!confirm('¿Generar un token nuevo? Los móviles y equipos conectados a este PC tendrán que volver a emparejarse con el QR.')) return;
+    const b = await DESK.regenToken();
+    Object.assign(s, { token: b.token, url: `http://127.0.0.1:${b.port}/mcp` });
+    await mcpConnect(s, true).catch(() => {});
+    save(); renderMcp(); toast('TOKEN NUEVO: vuelve a emparejar tus dispositivos');
+  }
   if (act === 'reconnect') mcpConnect(s);
   if (act === 'del') { S.mcp = S.mcp.filter((x) => x !== s); save(); renderMcp(); renderTargets(); renderLog(); }
   if (['addfolder', 'rmfolder', 'tson', 'tsoff'].includes(act)) {
@@ -1325,6 +1809,15 @@ $('#mcpList').addEventListener('click', async (e) => {
 // ---------- arranque ----------
 async function boot() {
   S.threads.flatMap((t) => t.messages).forEach((m) => { if (m.pending) { m.pending = false; m.error = m.error || 'Interrumpido'; } });
+  await hydrateFiles();
+  persistFiles(); // migra a IndexedDB los adjuntos que aún iban dentro del estado
+  if (!DESK) navigator.storage?.persist?.().catch(() => {}); // que el navegador no los borre si falta espacio
+  // Estadísticas solo de proveedores que existen y modelos que siguen en su lista (la lista solo cambia con datos confirmados).
+  for (const k of Object.keys(S.health)) {
+    const [id, model] = k.split('::');
+    const p = S.providers.find((x) => x.id === id);
+    if (k.startsWith('mcp:') ? !S.mcp.some((x) => `mcp:${x.id}` === id) : !p || !p.models.includes(model)) delete S.health[k];
+  }
   if (DESK) {
     // El puente integrado del PC aparece siempre como primer servidor MCP.
     const b = DESK.bridge();
