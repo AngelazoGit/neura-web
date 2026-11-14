@@ -61,10 +61,12 @@ const DEFAULT_INSTRUCTIONS = 'Responde siempre en español y solo en español: n
 // ---------- estado ----------
 const S = Object.assign({
   providers: [], mcp: [], threads: [], active: null, target: null, autoSkip: true,
-  health: {}, ctxTokens: 6000, instructions: DEFAULT_INSTRUCTIONS, council: false, councilKeys: [], useTools: false, vault: null, skills: [], projects: [], project: null,
+  health: {}, ctxTokens: 6000, instructions: DEFAULT_INSTRUCTIONS, council: false, councilKeys: [], useTools: false, vault: null, skills: [], projects: [], project: null, gateway: { enabled: false, localOnly: false },
 }, load());
 // Migración: el chat único de versiones anteriores pasa a ser el primer hilo.
 if (S.messages) { if (S.messages.length) S.threads.unshift({ id: S.active = uid(), title: S.messages.find((m) => m.role === 'user')?.content.slice(0, 48) || 'HILO', messages: S.messages, ts: Date.now() }); delete S.messages; }
+// Nivel de uso: los usuarios existentes siguen en profesional; los nuevos eligen al empezar.
+if (S.level == null && (S.providers.length || S.threads.some((t) => t.messages.length))) S.level = 'pro';
 // Gemini retiró los 2.5: se pasa a los alias que siempre apuntan al modelo vigente.
 const GEMINI_OLD = { 'gemini-2.5-flash': 'gemini-flash-latest', 'gemini-2.5-flash-lite': 'gemini-flash-lite-latest' };
 S.providers.filter((p) => p.preset === 'gemini').forEach((p) => { p.models = [...new Set(p.models.map((m) => GEMINI_OLD[m] || m))]; });
@@ -93,8 +95,32 @@ function save() {
   }
   // Los adjuntos ya guardados en IndexedDB se quedan fuera: el hilo solo conserva su referencia.
   const data = JSON.stringify(st, (k, v) => (v && v.ref && (v.kind === 'image' || v.kind === 'text') ? { ...v, data: undefined, text: undefined } : v));
-  try { if (DESK) DESK.save(data); else localStorage.setItem(LS, data); storageWarn(null); }
+  try { if (DESK) { DESK.save(data); pushGatewaySoon(); } else localStorage.setItem(LS, data); storageWarn(null); }
   catch (e) { storageWarn(e); }
+}
+// ---------- Neura Gateway (PC): otras herramientas usan Neura como proveedor ----------
+// Orden como AUTO-SALTO: la IA elegida y después por calidad. Respeta SOLO GRATIS. Solo IAs compatibles con OpenAI.
+function gatewayPayload() {
+  const g = S.gateway || {};
+  const name = (t) => `${slug(S.providers.find((p) => p.id === t.pid).name)}/${t.model}`;
+  const cloud = targets().filter((t) => t.pid && t.kind === 'openai' && (!S.freeOnly || isFree(t)));
+  const mine = targets().filter((t) => t.kind === 'mcp' && S.mcp.find((s) => s.id === t.sid)?.local);
+  const first = findT(S.target);
+  // Por clave: targets() crea objetos nuevos en cada llamada.
+  const usable = new Set([...cloud, ...mine].map((t) => t.key));
+  const ordered = [first, ...[...cloud, ...mine].sort((a, b) => score(b) - score(a))]
+    .filter((t, i, a) => t && usable.has(t.key) && a.findIndex((x) => x?.key === t.key) === i);
+  return {
+    enabled: !!g.enabled, localOnly: !!g.localOnly, freeOnly: !!S.freeOnly, unknownAsAuto: !!g.unknownAsAuto,
+    providers: cloud.map((t) => { const p = S.providers.find((x) => x.id === t.pid); return { id: name(t), url: p.baseUrl, apiKey: p.apiKey || '', model: t.model }; }),
+    order: ordered.map((t) => (t.pid ? name(t) : t.model)),
+  };
+}
+let gwSent = '', gwTimer;
+function pushGatewaySoon() {
+  if (!DESK?.gateway) return;
+  clearTimeout(gwTimer);
+  gwTimer = setTimeout(() => { const c = JSON.stringify(gatewayPayload()); if (c !== gwSent) { gwSent = c; DESK.gateway(JSON.parse(c)); } }, 300);
 }
 // Aviso fijo (no un mensaje que desaparece) mientras lo último no esté guardado.
 function storageWarn(e) {
@@ -896,11 +922,13 @@ function renderLog() {
     log.innerHTML = `<div class="empty">
       <svg viewBox="0 0 40 46" class="biglogo" aria-hidden="true">${$('.logo').innerHTML}</svg>
       <div class="big">NEURA</div><div class="sub">ESPERANDO ENTRADA</div>
-      ${S.providers.length ? '' : wizardHTML()}
+      ${S.providers.length || S.wizardDone ? '' : wizardHTML()}
+      ${S.level === 'basic' ? `<div class="tips"><b>💡 CÓMO USAR BIEN LAS IAs</b><ul>${TIPS.map((t) => `<li>${t}</li>`).join('')}</ul></div>` : ''}
       <ol><li>${n ? `<b>${n} modelos</b> conectados.` : 'Pulsa <b>⚙</b> y añade IAs públicas con su clave gratuita (Gemini, Groq, OpenRouter…).'}</li>
       <li>Pulsa <b>⬡</b> para conectar tu IA local mediante un servidor MCP.</li>
       <li><b>AUTO-SALTO</b>: si una IA agota sus tokens gratis, contesta otra.</li>
       <li><b>⚖ CONSEJO</b>: pregunta a varias IAs a la vez y recibe la mejor respuesta combinada.</li></ol></div>`;
+    renderLocalAI();
     return;
   }
   log.innerHTML = logHTML(th);
@@ -923,20 +951,200 @@ function schedule(m) {
 
 // ---------- configuración guiada: la primera IA en un minuto ----------
 const WIZ = ['gemini', 'groq', 'openrouter', 'mistral', 'cerebras'];
+// Qué pide cada proveedor gratuito para crear la clave. Los límites gratuitos los fija cada uno y cambian.
+const GUIDE = {
+  gemini: { need: 'Una cuenta de Google.', steps: ['Inicia sesión con tu cuenta de Google.', 'Pulsa «Create API key».', 'Copia la clave y pégala abajo.'],
+    note: 'En el nivel gratuito, Google puede usar lo que escribes para mejorar sus productos: no pegues datos personales ni de clientes.' },
+  groq: { need: 'Un correo, o tu cuenta de Google o GitHub.', steps: ['Crea tu cuenta o inicia sesión.', 'Pulsa «Create API Key», ponle un nombre y créala.', 'Cópiala (solo se muestra una vez) y pégala abajo.'] },
+  openrouter: { need: 'Un correo, o tu cuenta de Google o GitHub.', steps: ['Inicia sesión.', 'Pulsa «Create Key», ponle un nombre y créala.', 'Cópiala y pégala abajo.'], note: 'Neura solo usará sus modelos gratuitos (:free).' },
+  mistral: { need: 'Un correo; puede pedirte verificar tu teléfono.', steps: ['Crea tu cuenta en su consola.', 'Entra en «API Keys» y crea una clave.', 'Cópiala y pégala abajo.'] },
+  cerebras: { need: 'Un correo electrónico.', steps: ['Crea tu cuenta o inicia sesión.', 'Entra en «API Keys» y crea una clave.', 'Cópiala y pégala abajo.'] },
+};
+let wzMode = DESK ? 'local' : 'cloud', wzPreset = 'gemini';
 function wizardHTML() {
+  const level = S.level ? '' : `<div class="level">
+      <b>¿Es tu primera vez usando IAs?</b>
+      <div class="row wrap"><button class="btn sm" data-level="basic">SÍ, SOY PRINCIPIANTE</button><button class="btn sm ghost" data-level="pro">YA LAS USO</button></div>
+      <span class="hint">Principiante muestra lo esencial, consejos y habilidades que enseñan a usarlas bien. Puedes cambiarlo en ⚙.</span>
+    </div>`;
   return `<div class="card wizard">
-    <h4>CONFIGURA TU PRIMERA IA · GRATIS, 1 MINUTO</h4>
-    <label>1. ELIGE UNA IA<select id="wzPreset">${WIZ.map((k, i) => `<option value="${k}">${PRESETS[k].name}${i ? '' : ' (recomendada)'}</option>`).join('')}</select></label>
-    <div class="hint">2. <a id="wzKey" href="${esc(PRESETS.gemini.keyUrl)}" target="_blank" rel="noopener">Abre su página y crea una clave gratuita ▸</a> (inicia sesión, pulsa «Create API key» y cópiala).</div>
-    <label>3. PEGA LA CLAVE<input id="wzApiKey" type="password" autocomplete="off" placeholder="pega aquí tu clave"></label>
-    <button class="btn wide" id="wzGo">CONECTAR Y PROBAR</button>
-    <div class="hint" id="wzMsg">La clave se guarda solo en este dispositivo.</div>
+    <h4>EMPIEZA CON LA IA · GRATIS</h4>
+    ${level}
+    <div class="tabs">
+      <button type="button" data-wz="local" class="${wzMode === 'local' ? 'on' : ''}">💻 IA EN ESTE EQUIPO<small>sin cuentas ni claves</small></button>
+      <button type="button" data-wz="cloud" class="${wzMode === 'cloud' ? 'on' : ''}">☁ IA EN INTERNET<small>gratis, con una cuenta</small></button>
+    </div>
+    <div id="wzBody">${wzMode === 'local' ? localAIHTML() : cloudHTML()}</div>
   </div>`;
 }
-$('#log').addEventListener('change', (e) => { if (e.target.id === 'wzPreset') $('#wzKey').href = PRESETS[e.target.value].keyUrl; });
+function cloudHTML() {
+  const g = GUIDE[wzPreset];
+  return `<label>1. ELIGE UNA IA<select id="wzPreset">${WIZ.map((k, i) => `<option value="${k}" ${k === wzPreset ? 'selected' : ''}>${PRESETS[k].name}${i ? '' : ' (recomendada)'}</option>`).join('')}</select></label>
+    <div class="hint">Necesitas: <b>${esc(g.need)}</b></div>
+    <div class="hint">2. <a id="wzKey" href="${esc(PRESETS[wzPreset].keyUrl)}" target="_blank" rel="noopener">Abre su página ▸</a></div>
+    <ol class="steps">${g.steps.map((x) => `<li>${esc(x)}</li>`).join('')}</ol>
+    ${g.note ? `<div class="hint warn">⚠️ ${esc(g.note)}</div>` : ''}
+    <label>3. PEGA LA CLAVE<input id="wzApiKey" type="password" autocomplete="off" placeholder="pega aquí tu clave"></label>
+    <button class="btn wide" id="wzGo">CONECTAR Y PROBAR</button>
+    <div class="hint" id="wzMsg">La clave se guarda solo en este dispositivo. Los límites gratuitos los fija cada proveedor y pueden cambiar.</div>`;
+}
+const renderWizard = () => { const b = document.getElementById('wzBody'); if (b) b.innerHTML = wzMode === 'local' ? localAIHTML() : cloudHTML(); renderLocalAI(); };
+
+// ---------- IA en este equipo (Ollama), sin cuentas ----------
+// Neura no instala Ollama (pide permisos de administrador y cambia por sistema): detecta si falta y enlaza el instalador.
+const OLLAMA = 'http://127.0.0.1:11434';
+const local = { status: 'unknown', models: [], progress: null, err: '', ctl: null };
+function recommendedModel(ram) {
+  if (ram && ram < 7) return { model: 'llama3.2:3b', size: '2 GB', gb: 2 };
+  if (ram && ram < 15) return { model: 'qwen3:4b', size: '2,5 GB', gb: 2.5 };
+  return { model: 'qwen3:8b', size: '5 GB', gb: 5.2 };
+}
+async function checkLocal() {
+  if (!DESK) return;
+  local.status = 'checking'; renderLocalAI();
+  try {
+    const r = await xfetch(OLLAMA + '/api/tags', { signal: AbortSignal.timeout(4000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    local.models = ((await r.json()).models || []).map((m) => m.name).filter((n) => !/embed/i.test(n));
+    local.status = 'ready';
+  } catch { local.status = 'missing'; }
+  renderLocalAI();
+}
+function localAIHTML() {
+  if (!DESK) return `<div class="hint">La IA sin cuentas funciona en <b>Neura para PC</b>, que usa tu propio ordenador.
+    <a href="https://github.com/AngelazoGit/neura/releases/latest" target="_blank" rel="noopener">Descárgalo ▸</a>
+    Si ya lo tienes, conecta este dispositivo con el QR de tu PC en <b>⬡</b>.</div>`;
+  return '<div class="localAI"></div>';
+}
+function localAIInner() {
+  const b = DESK.bridge(), rec = recommendedModel(b.ram);
+  const os = { win32: 'windows', darwin: 'mac' }[b.platform] || 'linux';
+  if (local.status === 'unknown' || local.status === 'checking') return '<div class="hint">Comprobando si tu equipo tiene Ollama…</div>';
+  if (local.status === 'missing') return `<ol class="steps">
+      <li>Instala <b>Ollama</b>, el programa gratuito que ejecuta la IA en tu equipo: <a href="https://ollama.com/download/${os}" target="_blank" rel="noopener">DESCARGAR PARA ${os.toUpperCase()} ▸</a></li>
+      <li>Ábrelo cuando termine (queda funcionando en segundo plano).</li>
+      <li>Vuelve aquí y pulsa: <button type="button" class="btn sm" data-lai="check">YA LO HE INSTALADO</button></li></ol>`;
+  if (local.status === 'pulling') {
+    const p = local.progress || {}, pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+    return `<div class="hint">Descargando <b>${esc(local.pulling)}</b>… puede tardar unos minutos.</div>
+      <progress id="lpBar" max="100" value="${pct}"></progress>
+      <div class="row"><span class="mono" id="lpTxt">${esc(p.status || 'preparando')} ${p.total ? `· ${pct}%` : ''}</span><button type="button" class="btn sm ghost" data-lai="cancel">CANCELAR</button></div>`;
+  }
+  const have = local.models;
+  return `<div class="hint">✓ Ollama está funcionando. Tu equipo tiene <b>${b.ram || '?'} GB</b> de memoria.</div>
+    ${have.length ? `<div class="hint">Ya tienes: ${have.map((m) => `<button type="button" class="btn sm" data-lai="use" data-m="${esc(m)}">USAR ${esc(m)}</button>`).join(' ')}</div>` : ''}
+    <div class="hint">Te recomendamos <b>${rec.model}</b> (descarga de unos ${rec.size}): ${have.includes(rec.model) ? 'ya lo tienes.' : ''}
+      ${b.freeDisk != null ? `Espacio libre: <b>${b.freeDisk} GB</b>.` : ''} Es una orientación según tu memoria: tras instalarlo, Neura lo prueba y te dice cuánto tarda en tu equipo.</div>
+    ${b.freeDisk != null && b.freeDisk < rec.gb + 2 && !have.includes(rec.model) ? `<div class="hint red">⚠️ Poco espacio en disco para ${rec.model} (necesita unos ${rec.size} y conviene dejar margen). Libera espacio antes de descargarlo.</div>` : ''}
+    ${local.test ? `<div class="hint ${local.test.ok ? '' : 'red'}">${local.test.ok ? `✓ Prueba de ${esc(local.test.model)}: respondió en ${(local.test.ms / 1000).toFixed(1)} s${local.test.ms > 20000 ? ' (lento en este equipo: prueba un modelo más pequeño si se te hace pesado)' : ''}.` : `✕ La prueba de ${esc(local.test.model)} falló: ${esc(local.test.err)}`}</div>` : ''}
+    ${have.includes(rec.model) ? '' : `<button type="button" class="btn wide" data-lai="pull" data-m="${rec.model}">DESCARGAR Y USAR ${rec.model}</button>`}
+    ${local.err ? `<div class="hint red">${esc(local.err)}</div>` : ''}
+    <div class="hint">Funciona sin internet y lo que escribes no sale de tu equipo. Es más lenta y sabe menos que las IAs grandes de internet.</div>`;
+}
+function renderLocalAI() {
+  for (const el of document.querySelectorAll('.localAI')) el.innerHTML = localAIInner();
+  if (DESK && local.status === 'unknown') checkLocal();
+}
+async function useLocalModel(model) {
+  const s = S.mcp.find((x) => x.local);
+  await mcpConnect(s, true).catch(() => {});
+  const key = `mcp:${s.id}::ollama/${model}`;
+  if (!findT(key)) { local.err = 'El puente no ve el modelo todavía: pulsa RECONECTAR en ⬡ → ESTE PC.'; return renderLocalAI(); }
+  // Prueba real antes de dar la instalación por buena: la recomendación por memoria es solo orientativa.
+  local.err = ''; local.test = null; renderLocalAI(); toast(`Probando ${model} en tu equipo…`);
+  const t0 = performance.now();
+  try {
+    const r = await callTarget(findT(key), [{ role: 'user', content: 'Responde solo: OK' }], () => {});
+    if (!String(r || '').trim()) throw new Error('respuesta vacía');
+    local.test = { model, ok: true, ms: Math.round(performance.now() - t0) };
+  } catch (e) {
+    local.test = { model, ok: false, err: netHint(e) };
+    return renderLocalAI();
+  }
+  S.target = key; S.wizardDone = true;
+  save(); renderTargets(); renderLog(); renderLocalAI();
+  toast(`✓ ${model} lista: respondió en ${(local.test.ms / 1000).toFixed(1)} s. ¡Escribe tu primera pregunta!`); $('#input').focus();
+}
+async function pullModel(model) {
+  Object.assign(local, { status: 'pulling', pulling: model, progress: null, err: '', ctl: new AbortController() });
+  renderLocalAI();
+  try {
+    const r = await xfetch(OLLAMA + '/api/pull', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, stream: true }), signal: local.ctl.signal });
+    if (!r.ok) throw httpErr(r.status, await r.text(), r.headers);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line) continue;
+        const j = JSON.parse(line);
+        if (j.error) throw new Error(j.error);
+        local.progress = { status: j.status, done: j.completed || 0, total: j.total || 0 };
+        const bar = document.getElementById('lpBar'), txt = document.getElementById('lpTxt'), pct = j.total ? Math.round((j.completed / j.total) * 100) : 0;
+        if (bar) bar.value = pct;
+        if (txt) txt.textContent = `${j.status}${j.total ? ` · ${pct}%` : ''}`;
+      }
+    }
+    local.status = 'ready'; local.models = [...new Set([...local.models, model])];
+    await useLocalModel(model);
+  } catch (e) {
+    local.status = 'ready';
+    local.err = e.name === 'AbortError' ? 'Descarga cancelada.' : `No se pudo descargar: ${netHint(e)}`;
+    renderLocalAI();
+  }
+}
+
+// ---------- nivel: principiante o profesional ----------
+// Principiante: lo esencial, consejos de uso correcto y habilidades que enseñan. Profesional: todo.
+const STARTERS = [
+  { name: 'Mejorar mi pregunta', description: 'Reescribe tu petición para que la IA la entienda mejor y te explica por qué. Usar para aprender a pedir mejor o cuando no sepas cómo plantear algo.',
+    instructions: '# Mejorar mi pregunta\n\nAyudas a la persona a aprender a usar bien las IAs.\n\n1. Lee su petición y detecta lo que falta: objetivo, contexto, formato de la respuesta, nivel de detalle y límites.\n2. Si falta algo esencial, haz como máximo 3 preguntas breves.\n3. Escribe una versión mejorada de la petición, lista para copiar, entre comillas.\n4. Explica en 2-4 viñetas qué cambiaste y por qué, para que aprenda a hacerlo por su cuenta.\n\nNo respondas todavía a la petición original salvo que te lo pida.' },
+  { name: 'Aprender paso a paso', description: 'Profesor paciente: explica un tema por partes, con ejemplos, y comprueba que lo entiendes. Usar para aprender o estudiar algo nuevo.',
+    instructions: '# Aprender paso a paso\n\nActúas como profesor paciente.\n\n1. Si no está claro, pregunta qué sabe ya del tema y adapta el nivel.\n2. Explica en bloques cortos, con un ejemplo cotidiano en cada uno.\n3. Tras cada bloque, haz una pregunta sencilla para comprobar que lo ha entendido y espera su respuesta.\n4. Si se equivoca, corrige con amabilidad y explícalo de otra forma.\n5. Al final, resume lo aprendido en 3-5 viñetas y propón el siguiente paso.' },
+  { name: 'Comprobar una respuesta', description: 'Revisa críticamente una respuesta de una IA u otra fuente: señala lo dudoso y cómo verificarlo. Es una evaluación orientativa, no una verificación con fuentes. Usar antes de fiarte de un dato importante.',
+    instructions: '# Comprobar una respuesta\n\nRevisas críticamente una respuesta que la persona pega (de una IA o de otra fuente).\n\n1. Separa los hechos comprobables de las opiniones.\n2. Señala las afirmaciones dudosas, sin fuente o que podrían estar desactualizadas, y explica por qué.\n3. Indica cómo verificar cada punto importante: qué buscar y en qué tipo de fuente fiable.\n4. Termina con una valoración orientativa: «parece sólida», «conviene revisar» o «dudosa».\n5. Si no has consultado fuentes en esta conversación, empieza la valoración con «Evaluación orientativa: no he consultado fuentes; los hechos no están verificados». Si las has consultado, cítalas.\n\nNo presentes tu valoración como una certificación. No inventes fuentes ni enlaces.' },
+];
+function installStarters() {
+  let n = 0;
+  for (const st of STARTERS) {
+    if (liveSkills().some((k) => k.name === st.name)) continue;
+    S.skills.push({ id: uid() + uid(), ...st, version: 1, updatedAt: Date.now() }); n++;
+  }
+  if (n) { save(); syncAll(); }
+  return n;
+}
+function applyLevel() {
+  document.body.classList.toggle('basic', S.level === 'basic');
+  if (S.level === 'basic' && (S.council || S.useTools)) { S.council = false; S.useTools = false; }
+}
+const TIPS = [
+  '<b>Da contexto</b>: quién eres, qué quieres conseguir y en qué formato quieres la respuesta.',
+  '<b>Comprueba lo importante</b>: las IAs pueden equivocarse con mucha seguridad. Prueba ✦ «Comprobar una respuesta».',
+  '<b>Cuida tus datos</b>: no pegues contraseñas ni datos personales en IAs de internet. Para lo privado, usa 🔒 PRIVADO con la IA de tu equipo.',
+  '<b>Aprende a pedir</b>: activa ✦ «Mejorar mi pregunta» y verás cómo plantearlo mejor.',
+];
+document.addEventListener('click', async (e) => {
+  const d = e.target.dataset || {};
+  if (d.wz) { wzMode = d.wz; document.querySelectorAll('[data-wz]').forEach((b) => b.classList.toggle('on', b.dataset.wz === wzMode)); renderWizard(); }
+  if (d.level) {
+    S.level = d.level;
+    if (d.level === 'basic') installStarters();
+    applyLevel(); save(); renderTargets(); renderLog();
+    toast(d.level === 'basic' ? 'Modo principiante: lo esencial y 3 habilidades para aprender (✦)' : 'Modo profesional: todas las funciones visibles');
+  }
+  if (d.lai === 'check') checkLocal();
+  if (d.lai === 'pull') pullModel(d.m);
+  if (d.lai === 'cancel') local.ctl?.abort();
+  if (d.lai === 'use') useLocalModel(d.m);
+});
+$('#log').addEventListener('change', (e) => { if (e.target.id === 'wzPreset') { wzPreset = e.target.value; renderWizard(); } });
 $('#log').addEventListener('click', async (e) => {
   if (e.target.id !== 'wzGo') return;
-  const key = $('#wzApiKey').value.trim(), k = $('#wzPreset').value, msg = $('#wzMsg');
+  const key = $('#wzApiKey').value.trim(), k = wzPreset, msg = $('#wzMsg');
   if (!key) return toast('Pega la clave primero', true);
   e.target.disabled = true; msg.textContent = 'Conectando y descargando la lista de modelos…';
   let p = S.providers.find((x) => x.wizard);
@@ -947,7 +1155,7 @@ $('#log').addEventListener('click', async (e) => {
   try {
     if (!p.models[0]) throw new Error('No se encontraron modelos');
     await callTarget(t, [{ role: 'user', content: 'Responde solo: OK' }], () => {});
-    delete p.wizard; S.target = t.key; save(); renderTargets(); renderLog();
+    delete p.wizard; S.target = t.key; S.wizardDone = true; save(); renderTargets(); renderLog();
     toast(`✓ ${p.name} conectada. ¡Ya puedes escribir!`); $('#input').focus();
   } catch (err) {
     msg.textContent = `No funcionó: ${friendly(err)} Revisa la clave y vuelve a intentarlo.`;
@@ -1009,6 +1217,10 @@ function renderSettings() {
   const all = targets();
   const sec = DESK?.secure?.();
   $('#settings').innerHTML = `
+    <h3>NIVEL</h3>
+    <div class="row wrap"><button class="btn sm ${S.level === 'basic' ? '' : 'ghost'}" data-level="basic">PRINCIPIANTE</button><button class="btn sm ${S.level !== 'basic' ? '' : 'ghost'}" data-level="pro">PROFESIONAL</button><button class="btn sm ghost" id="addStarters">+ HABILIDADES DE INICIO</button></div>
+    <p class="hint">Principiante muestra lo esencial y consejos de uso. Profesional añade CONSEJO, HERRAMIENTAS y el resto de opciones avanzadas.</p>
+    ${DESK ? `<h3>💻 IA EN ESTE EQUIPO</h3>${localAIHTML()}` : ''}
     <h3>INSTRUCCIONES PARA TODAS LAS IAs</h3>
     <textarea id="instructions" rows="3" class="wide-input" placeholder="Ej.: responde solo en español y de forma breve">${esc(S.instructions ?? '')}</textarea>
     <p class="hint">Se envían a todas las IAs en cada mensaje (idioma, tono, longitud…). Déjalo vacío para no enviar nada.</p>
@@ -1029,6 +1241,7 @@ function renderSettings() {
       : `<p class="hint">Cifra tus claves API y tokens con un PIN (AES-256). Te lo pedirá al abrir Neura.</p>
         <div class="row"><input type="password" id="pinNew" inputmode="numeric" autocomplete="new-password" placeholder="PIN (mín. 4)"><button class="btn sm" id="vaultOn">ACTIVAR PIN</button></div>`}
     <p class="hint">Las claves nunca se sincronizan entre dispositivos: solo viajan los hilos.</p>`;
+  renderLocalAI();
 }
 
 function renderMcp() {
@@ -1052,6 +1265,46 @@ function renderMcp() {
   }).join('');
 }
 
+// Configuración lista para copiar en otras herramientas. La clave es el token del puente.
+function gatewayHTML(b) {
+  const g = S.gateway || {}, base = `http://127.0.0.1:${b.port}`, t = b.gatewayToken;
+  const snip = (title, text, note = '') => `<details><summary>${title}</summary><pre class="snip">${esc(text)}</pre>${note ? `<div class="hint">${note}</div>` : ''}<button type="button" class="btn sm ghost" data-act="copysnip">COPIAR</button></details>`;
+  return `<h4>🔌 NEURA GATEWAY · CONECTAR OTRAS HERRAMIENTAS</h4>
+    <div class="hint">Usa Neura (tus IAs, AUTO-SALTO y SOLO GRATIS) como proveedor en otras aplicaciones: Continue, Cline, Aider, Open WebUI…</div>
+    <label class="auto"><input type="checkbox" data-act="gw" ${g.enabled ? 'checked' : ''}> ACTIVAR GATEWAY</label>
+    ${!g.enabled ? '' : `<label class="auto"><input type="checkbox" data-act="gwlocal" ${g.localOnly ? 'checked' : ''}> SOLO MODELOS DE ESTE EQUIPO</label>
+    <label class="auto"><input type="checkbox" data-act="gwunknown" ${g.unknownAsAuto ? 'checked' : ''}> USAR «auto» PARA NOMBRES DE MODELO DESCONOCIDOS</label>
+    <div class="hint">Sin esta opción, un nombre que Neura no conoce (por ejemplo, una errata) da error y no se envía a ninguna IA.</div>
+    <div class="mono">TOKEN DEL GATEWAY: <span class="secret">${esc(t)}</span> <button class="btn sm red" data-act="regengw" title="Si se filtra">REGENERAR</button></div>
+    <div class="hint">Es distinto del token del puente: solo sirve para pedir respuestas y ver los modelos, no da acceso a tus hilos, archivos ni ajustes.</div>
+    <div class="mono">Compatible con OpenAI: ${esc(base)}/v1 · con Anthropic: ${esc(base)} · clave: el token del Gateway · modelo: <b>auto</b> (o uno concreto de /v1/models)</div>
+    <div class="hint">Configuraciones de ejemplo: la API se ha comprobado con los SDK oficiales de OpenAI y Anthropic, pero aún no con cada herramienta.</div>
+    ${snip('Continue (config.yaml) · ejemplo', `models:
+  - name: Neura (auto)
+    provider: openai
+    model: auto
+    apiBase: ${base}/v1
+    apiKey: ${t}`)}
+    ${snip('Cline / Roo Code · ejemplo', `Proveedor: OpenAI Compatible
+Base URL: ${base}/v1
+API Key: ${t}
+Model ID: auto`)}
+    ${snip('Aider · ejemplo', `aider --openai-api-base ${base}/v1 --openai-api-key ${t} --model openai/auto`)}
+    ${snip('Open WebUI · ejemplo', `Ajustes → Conexiones → API de OpenAI
+URL: ${base}/v1
+Clave: ${t}`, 'Si Open WebUI corre en Docker, usa http://host.docker.internal:' + b.port + '/v1.')}
+    ${snip('Claude Code · ejemplo', `# macOS / Linux
+export ANTHROPIC_BASE_URL=${base}
+export ANTHROPIC_AUTH_TOKEN=${t}
+export ANTHROPIC_MODEL=auto
+
+# Windows (PowerShell)
+$env:ANTHROPIC_BASE_URL="${base}"
+$env:ANTHROPIC_AUTH_TOKEN="${t}"
+$env:ANTHROPIC_MODEL="auto"`,
+      'Revisa sus condiciones de uso antes de usarlo con modelos de otros proveedores. Los modelos gratuitos rinden peor en tareas largas de programación.')}
+    <div class="hint warn">⚠️ Cualquier programa de este PC con el token (y otros equipos, si abres el puente a tu red) usará tus claves y tus cuotas gratuitas. Si se filtra, pulsa REGENERAR.</div>`}`;
+}
 // Puente integrado en Neura Desktop: emparejar el móvil, carpetas para la IA y acceso fuera de casa.
 function localBridgeHTML() {
   const b = DESK.bridge();
@@ -1071,6 +1324,7 @@ function localBridgeHTML() {
         ${ts.https ? `<div class="mono">Web (https): https://${esc(ts.dns)}/ · MCP: https://${esc(ts.dns)}/mcp</div>${b.qrTs ? `<div class="qr"><img src="${esc(b.qrTs)}" alt="QR para fuera de casa"><span class="hint">QR para conectarte desde fuera (con Tailscale activo en el móvil).</span></div>` : ''}<button class="btn sm ghost" data-act="tsoff">DESACTIVAR HTTPS</button>`
         : `<button class="btn sm" data-act="tson">ACTIVAR HTTPS CON TAILSCALE</button>`}
         ${ts.error ? `<div class="mono red">${esc(ts.error)}</div>` : ''}`}
+    ${S.level === 'basic' ? '' : gatewayHTML(b)}
     <h4>📁 CARPETAS PARA LA IA</h4>
     <div class="hint">La IA podrá buscar y leer (nunca modificar) estos documentos con ƒ HERRAMIENTAS. Cualquiera con el token puede leerlos.</div>
     ${(b.folders || []).map((f) => `<div class="mono folder">${esc(f)} <button class="btn sm red" data-act="rmfolder" data-path="${esc(f)}">✕</button></div>`).join('')}
@@ -1736,6 +1990,8 @@ $('#settings').addEventListener('change', (e) => {
   if (k) { S.councilKeys = e.target.checked ? [...new Set([...S.councilKeys, k])] : S.councilKeys.filter((x) => x !== k); save(); }
 });
 $('#settings').addEventListener('click', async (e) => {
+  if (e.target.id === 'addStarters') { const n = installStarters(); toast(n ? `${n} habilidades añadidas (✦)` : 'Ya las tienes'); }
+  if (e.target.dataset.level) setTimeout(renderSettings, 0);
   if (e.target.id === 'vaultOn') {
     const pin = $('#pinNew').value;
     if (pin.length < 4) return toast('El PIN debe tener al menos 4 caracteres', true);
@@ -1775,6 +2031,11 @@ $('#mcpList').addEventListener('change', async (e) => {
   const s = S.mcp.find((x) => x.id === card.dataset.sid);
   if (act === 'sync') { s.sync = e.target.checked; save(); syncWith(s); }
   if (act === 'trust') { s.trustTools = e.target.checked; save(); }
+  if (act === 'gw' || act === 'gwlocal' || act === 'gwunknown') {
+    S.gateway = { ...S.gateway, [{ gw: 'enabled', gwlocal: 'localOnly', gwunknown: 'unknownAsAuto' }[act]]: e.target.checked };
+    save(); renderMcp();
+    if (act === 'gw') toast(e.target.checked ? '🔌 Gateway activo: copia la configuración de tu herramienta' : 'Gateway desactivado');
+  }
   if (act === 'mine') { s.mine = e.target.checked; save(); renderTargets(); }
   if (act === 'lan') {
     e.target.disabled = true;
@@ -1787,6 +2048,13 @@ $('#mcpList').addEventListener('click', async (e) => {
   const act = e.target.dataset.act, card = e.target.closest('[data-sid]'); if (!act || !card) return;
   const s = S.mcp.find((x) => x.id === card.dataset.sid);
   if (act === 'copytoken') navigator.clipboard?.writeText(DESK.bridge().token).then(() => toast('TOKEN COPIADO'));
+  if (act === 'regengw') {
+    if (!confirm('¿Generar un token nuevo para el Gateway? Las herramientas configuradas con el anterior dejarán de funcionar hasta que copies el nuevo.')) return;
+    await DESK.regenGatewayToken();
+    await mcpConnect(s, true).catch(() => {});
+    gwSent = ''; pushGatewaySoon(); renderMcp(); toast('TOKEN DEL GATEWAY NUEVO: actualízalo en tus herramientas');
+  }
+  if (act === 'copysnip') navigator.clipboard?.writeText(e.target.parentElement.querySelector('.snip').textContent).then(() => toast('COPIADO'));
   if (act === 'regentoken') {
     if (!confirm('¿Generar un token nuevo? Los móviles y equipos conectados a este PC tendrán que volver a emparejarse con el QR.')) return;
     const b = await DESK.regenToken();
@@ -1824,7 +2092,9 @@ async function boot() {
     let s = S.mcp.find((x) => x.local);
     if (!s) S.mcp.unshift(s = { id: 'local', local: true, name: 'ESTE PC', models: [], tools: [] });
     Object.assign(s, { url: `http://127.0.0.1:${b.port}/mcp`, token: b.token });
+    pushGatewaySoon();
   }
+  applyLevel();
   renderTargets(); renderLog();
   if (S.vault && S.vault.data && crypto.subtle) await unlockDialog();
   // Abierta desde el QR de un PC: se conecta sola a ese puente.
